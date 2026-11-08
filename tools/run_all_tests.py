@@ -8,7 +8,9 @@
   5 metrics     tools/test_metrics.py      every derived metric matches the known truth
   6 rules       tools/test_validate.py     clean trial has no errors; every validator rule fires on its mutation
   7 thresholds  tools/test_calibrate.py    thresholds estimated from historical data recover known values
-  8 coverage    (this file)                every derived metric, every validator rule and every constraint
+  8 boundaries  tools/test_thresholds.py   every validation_params_defaults value shifted x10 and x0.1 is
+                                           caught by a test (each threshold tested at its boundary)
+  9 coverage    (this file)                every derived metric, every validator rule and every constraint
                                            is exercised by a test -- no untested element
 
 Each step needs the previous ones: a metric test on a schema that does not build proves nothing.
@@ -30,6 +32,7 @@ STEPS = [
     ("metrics", ["test_metrics.py", YAML]),
     ("rules", ["test_validate.py", YAML]),
     ("thresholds", ["test_calibrate.py", YAML]),
+    ("boundaries", ["test_thresholds.py", YAML]),
 ]
 
 

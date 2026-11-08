@@ -15,6 +15,7 @@ Usage: test_validate.py [data_model.yaml]      exit 1 on failure
 """
 import datetime as dt
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -96,6 +97,90 @@ def m_r02_error(con):
 
 def m_fish(con, fate=None, fate_date=None):
     ins(con, "fish", fish_id="F1", trial_id=TRIAL, pit_tag="P1", unit_id="U1D1", fate=fate, fate_date=fate_date)
+
+# ---- threshold-boundary helpers (validation_params_defaults): a value just outside the default
+# boundary must fire, one just inside must stay silent (tools/test_thresholds.py shifts each
+# default x10 / x0.1 and requires a test to notice)
+def recount(con, unit, minus):
+    """harvest count of `unit` lower by `minus` fish (miscount; weighed biomass unchanged)"""
+    con.execute("UPDATE weighings SET n_fish = n_fish - ? WHERE record_id = ?", (minus, unit + "_HARV"))
+
+
+def scale_mid1_to_d0(con, ratio):
+    """U1D1 mid1 sample weights scaled so that W(mid1) = ratio x W(d0)"""
+    w0 = V.M.unit_weight(con, "U1D1", "d0")["w_g"]
+    w1 = V.M.unit_weight(con, "U1D1", "mid1")["w_g"]
+    con.execute("UPDATE weighings SET weight_g = weight_g * ? WHERE unit_id = 'U1D1' AND occasion = 'mid1'"
+                " AND sampling_type = 'sample'", (ratio * w0 / w1,))
+
+
+def d0_cv(con, cv_pct):
+    """U1D1 d0 sample weights spread around their mean to a within-unit CV of cv_pct (mean kept)"""
+    rows = con.execute("SELECT record_id, weight_g FROM weighings WHERE unit_id = 'U1D1' AND occasion = 'd0'"
+                       " AND sampling_type = 'sample'").fetchall()
+    ws = [w for _, w in rows]
+    m = sum(ws) / len(ws)
+    cv = 100 * math.sqrt(sum((w - m) ** 2 for w in ws) / (len(ws) - 1)) / m
+    for rid, w in rows:
+        con.execute("UPDATE weighings SET weight_g = ? WHERE record_id = ?", (m + (w - m) * cv_pct / cv, rid))
+
+
+def d2_mean_diff(con, pct):
+    """d0 count biomass of the D2 units scaled so that the D2 d0 mean is pct % above reference D1"""
+    w0 = {u: V.M.unit_weight(con, u, "d0")["w_g"] for (u,) in con.execute("SELECT unit_id FROM units")}
+    d1 = [w for u, w in w0.items() if u.endswith("D1")]
+    d2 = [w for u, w in w0.items() if u.endswith("D2")]
+    f = (1 + pct / 100.0) * (sum(d1) / len(d1)) / (sum(d2) / len(d2))
+    con.execute("UPDATE weighings SET biomass_kg = biomass_kg * ? WHERE unit_id LIKE '%D2' AND occasion = 'd0'"
+                " AND sampling_type IN ('stocking','bulk')", (f,))
+
+
+def hourly(con, sensor, variable, values, hours, unit="U1D1", start_day=30, position="in_unit"):
+    """hourly instant readings (nominal 60 min) of a separate sensor on day start_day, UTC hours"""
+    if not con.execute("SELECT 1 FROM sensors WHERE sensor_id = ?", (sensor,)).fetchone():
+        ins(con, "sensors", sensor_id=sensor, variable=variable)
+    for h, v in zip(hours, values):
+        ts = dt.datetime.combine(D0 + dt.timedelta(days=start_day), dt.time(0)) + dt.timedelta(hours=h)
+        ins(con, "environment", record_id="%s_%02d" % (sensor, h), timestamp=ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            unit_id=unit, variable=variable, aggregation="instant", nominal_interval_min=60, sensor_id=sensor,
+            measure_position=position, value=v)
+
+
+def o2_gap(con, gap_h):
+    """hourly o2_sat_pct with readings missing so that (time between readings - 1 h interval) = gap_h"""
+    hours = list(range(0, 6)) + list(range(6 + gap_h, 24))
+    hourly(con, "O2_U1D1", "o2_sat_pct", [95 + 0.1 * h for h in hours], hours)
+
+
+def temp_step(con, step_c):
+    """hourly inlet temperature with a step of step_c C within one hour (heater switched)"""
+    hours = list(range(12))
+    hourly(con, "TI_U1D1", "temp_c", [12.0 + 0.02 * h + (step_c if h >= 6 else 0) for h in hours], hours,
+           position="inlet")
+
+
+def flat(con, n_days):
+    """U1D1 daily temperature identical (12.005; data have 2 decimals) for n_days days from day 30"""
+    con.execute("UPDATE environment SET value = 12.005 WHERE unit_id = 'U1D1' AND variable = 'temp_c'"
+                " AND timestamp BETWEEN ? AND ?", (day(30), day(30 + n_days)))
+
+
+def detections(con, n):
+    """calibrated camera estimate on day 20 (no occasion within camera_window_days) with n detections"""
+    calib(con, "CALD", "U1D1", 0, 84)
+    camera(con, "U1D1", 20, cal="CALD", n=n)
+
+
+def kill_lag(con, lag_days):
+    """U1D1 removal_sampling event lag_days after the mid1 kill (day 42)"""
+    con.execute("UPDATE events SET date = ? WHERE unit_id = 'U1D1' AND event_type = 'removal_sampling'",
+                (day(42 + lag_days),))
+
+
+def cages(con, dist_m):
+    """U1D1 / U1D2 (different diets) become cages dist_m apart"""
+    con.execute("UPDATE units SET unit_type = 'cage', x_m = 0, y_m = 0 WHERE unit_id = 'U1D1'")
+    con.execute("UPDATE units SET unit_type = 'cage', x_m = ?, y_m = 0 WHERE unit_id = 'U1D2'", (dist_m,))
 
 
 MUTATIONS = [
@@ -206,6 +291,18 @@ MUTATIONS = [
     ("R41", None, "SY1 reference temperature +5 C for the first 20 days",
      lambda c: c.execute("UPDATE environment SET value = value + 5 WHERE system_id = 'SY1' AND timestamp < ?",
                          (day(20),))),
+    # ---- threshold boundaries: just outside the default -> must fire
+    ("R04", None, "U1D1 harvest count 2 fish low (89 vs 91 expected, 2.2 % > 2 % tolerance)",
+     lambda c: recount(c, "U1D1", 2)),
+    ("R05", None, "U1D1 mid1 unit weight 6 % below d0 (limit 5 %)", lambda c: scale_mid1_to_d0(c, 0.94)),
+    ("R06", None, "U1D1 d0 within-unit CV 22 % (limit 20 %)", lambda c: d0_cv(c, 22.0)),
+    ("R06", None, "D2 d0 mean 6 % above reference D1 (limit 5 %)", lambda c: d2_mean_diff(c, 6.0)),
+    ("R09", None, "U1D1 o2_sat_pct hourly sensor with a 7 h gap (max 6 h)", lambda c: o2_gap(c, 7)),
+    ("R09", None, "U1D1 inlet temperature step 3.5 C within 1 h (max 3 C/h)", lambda c: temp_step(c, 3.5)),
+    ("R09", None, "U1D1 temperature 4 identical daily readings (flat line >= 4)", lambda c: flat(c, 4)),
+    ("R10", None, "calibrated camera estimate with 29 detections (min 30)", lambda c: detections(c, 29)),
+    ("R14", None, "U1D1 removal_sampling event 2 days after the kill (max lag 1 day)", lambda c: kill_lag(c, 2)),
+    ("R31", None, "U1D1 / U1D2 become cages 40 m apart with different diets (<= 50 m)", lambda c: cages(c, 40)),
 ]
 
 
@@ -218,6 +315,19 @@ NEGATIVE = [
     ("R21", "dose_basis total_dm on both diets with analysed protein",
      lambda c: c.execute("UPDATE diets SET dose_value = CASE diet_id WHEN 'D1' THEN 1.0 ELSE 2.0 END,"
                          " dose_unit = 'g_kg', dose_basis = 'total_dm', dose_analyte = 'protein'")),
+    # ---- threshold boundaries: just inside the default -> must stay silent (4th item: only
+    # findings of that severity count, e.g. R04 reports a difference within tolerance as info)
+    ("R04", "U1D1 harvest count 1 fish low (90 vs 91, 1.1 % < 2 % tolerance)", lambda c: recount(c, "U1D1", 1),
+     "error"),
+    ("R05", "U1D1 mid1 unit weight 4 % below d0 (limit 5 %)", lambda c: scale_mid1_to_d0(c, 0.96)),
+    ("R06", "U1D1 d0 within-unit CV 18 % (limit 20 %)", lambda c: d0_cv(c, 18.0)),
+    ("R06", "D2 d0 mean 4 % above reference D1 (limit 5 %)", lambda c: d2_mean_diff(c, 4.0)),
+    ("R09", "U1D1 o2_sat_pct hourly sensor with a 5 h gap (max 6 h)", lambda c: o2_gap(c, 5)),
+    ("R09", "U1D1 inlet temperature step 2.5 C within 1 h (max 3 C/h)", lambda c: temp_step(c, 2.5)),
+    ("R09", "U1D1 temperature 3 identical daily readings (flat line needs 4)", lambda c: flat(c, 3)),
+    ("R10", "calibrated camera estimate with 31 detections (min 30)", lambda c: detections(c, 31)),
+    ("R14", "U1D1 removal_sampling event 1 day after the kill (max lag 1 day)", lambda c: kill_lag(c, 1)),
+    ("R31", "U1D1 / U1D2 become cages 60 m apart with different diets (> 50 m)", lambda c: cages(c, 60)),
 ]
 
 
@@ -291,11 +401,16 @@ def main():
         print("waived %s: %s" % (r, why))
 
     # 2b. negative mutations: legitimate changes that must NOT make the rule fire
-    for rid, desc, fn in NEGATIVE:
+    for rid, desc, fn, *only in NEGATIVE:
         c = copy(con)
-        fn(c)
-        c.commit()
-        new = [f for f in V.validate(c, model, TRIAL) if key(f) not in base and f["rule"] == rid]
+        try:
+            fn(c)
+            c.commit()
+        except sqlite3.Error as e:
+            fails.append("%s negative '%s' violates a database constraint: %s" % (rid, desc, e))
+            continue
+        new = [f for f in V.validate(c, model, TRIAL) if key(f) not in base and f["rule"] == rid
+               and (not only or f["severity"] == only[0])]
         print("%s %s must stay silent: %s" % ("ok  " if not new else "FAIL", rid, desc))
         if new:
             fails.append("%s fired on a legitimate change '%s': %s" % (rid, desc, new[0]["message"][:100]))

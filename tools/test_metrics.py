@@ -129,7 +129,9 @@ def test_synthetic():
     check("unit_day_risk deaths", sum(r["n_event"] for r in dr) == truth["U1D1"]["deaths"], keys=["unit_day_risk"])
     check("unit_day_risk censored (5 sampled)", sum(r["n_censored"] for r in dr) == 5, keys=["unit_day_risk"])
     p = M.params(con, "T1")
-    check("params defaults", p["min_coverage_pct"] == 90 and p["dead_weight_ratio"] == 1)
+    # compared with the YAML (not literals), so that a shifted default is caught by a boundary test,
+    # never by this check (tools/test_thresholds.py)
+    check("params = validation_params_defaults", p == model["validation_params_defaults"], p)
 
 
 # ------------------------------------------------------------------ tiny hand-built databases
@@ -167,8 +169,8 @@ def final(ins, k, n, kg, typ="harvest"):
         n_fish=n, biomass_kg=kg, weight_basis="round")
 
 
-def test_rich_hand_computed():
-    """4-day window, every period metric against hand arithmetic.
+def rich_db():
+    """4-day window used by test_rich_hand_computed (see there for the hand arithmetic).
     d0: 100 fish 10 kg (100 g); 2 deaths on day 1 (0.2 kg, after weighing: in window);
     final day 4 harvest count 97 fish 11.64 kg (120 g) -> 1 fish unaccounted."""
     con, ins = tiny()
@@ -205,6 +207,17 @@ def test_rich_hand_computed():
     ins("unit_geometry", record_id="G1", unit_id="U", valid_from=day(2), volume_m3=4.0)
     ins("deviations", record_id="DV", trial_id="T", date=day(1), unit_id="U", category="exclusion",
         exclusion_scope="unit", exclusion_reason="technical", description="pending")
+    return con, ins
+
+
+RICH_INTAKE = 4 * (90.0 - 5.0 / 0.8)       # rich_db: 5 g uneaten DM/day, recovery 0.8
+RICH_PROT = RICH_INTAKE * 500.0 / 1000      # 450 g/kg as fed / dm 0.9
+RICH_C_END = 550.0 * 0.32                   # whole_body_final 55 % of DM x 320 g DM/kg wet
+
+
+def test_rich_hand_computed():
+    """4-day window, every period metric against hand arithmetic (data: rich_db)."""
+    con, ins = rich_db()
 
     W = lambda k: 100.0 * 1.2 ** (k / 4)            # noqa: E731  geometric interpolation 100 -> 120 g
     n = {0: 100, 1: 100, 2: 98, 3: 98, 4: 97}
@@ -537,11 +550,105 @@ def test_nh3():
     check("nh3 NULL salinity -> NULL", f(1.0, 8.0, 15.0, None) is None, keys=["nh3_n_mg_l"])
 
 
+# ------------------------------------------------------------------ threshold boundaries
+# Each validation_params_defaults value used by a metric is tested on both sides of its boundary
+# with the default in force (tools/test_thresholds.py shifts each default x10 / x0.1).
+def test_camera_window_and_detections():
+    """unit_weight_g source 2: camera estimates within p:camera_window_days (3) of the occasion
+    with n_detections >= p:min_detections (30)."""
+    def db(*cams):
+        con, ins = tiny()
+        ins("unit_occasions", unit_id="U", occasion="mid1", seq=2, occasion_date=day(10))
+        ins("camera_calibrations", calibration_id="CAL", unit_id="U", camera_id="C1", algorithm_version="v1",
+            valid_from=day(0), valid_to=day(30), model="bias_only", bias_g=10.0)
+        for k, (d, n, w) in enumerate(cams):
+            ins("camera_estimates", unit_id="U", camera_id="C1", period_start=day(d) + "T08:00:00Z",
+                period_end=day(d) + "T16:00:00Z", n_detections=n, mean_weight_g=w, algorithm_version="v1")
+        return M.unit_weight(con, "U", "mid1")
+    w = db((12, 500, 160.0))
+    check("camera 2 days from the occasion used (window 3)", w is not None and w["w_source"] == "camera"
+          and close(w["w_g"], 150.0), w, ["unit_weight_g"])
+    w = db((14, 500, 160.0))
+    check("camera 4 days from the occasion not used (window 3)", w is None, w, ["unit_weight_g"])
+    w = db((10, 31, 160.0), (8, 29, 310.0))
+    check("camera 31 detections used, 29 ignored (min 30)", w is not None and close(w["w_g"], 150.0), w,
+          ["unit_weight_g"])
+
+
+def test_interp_days():
+    """degree_days step (3): linear interpolation over gaps of <= p:max_interp_days (3) missing days."""
+    for missing, n_imp, dd in ((3, 3, 10 * 10.0 + 0.0), (4, 0, None)):
+        con, ins = tiny()
+        final(ins, 10, 100, 12.0)
+        for k in range(11):
+            if not 3 <= k < 3 + missing:
+                ins("environment", record_id="T%d" % k, timestamp=day(k) + "T11:00:00Z", unit_id="U",
+                    variable="temp_c", aggregation="daily_mean", value=10.0)
+        pm = M.period_metrics(con, "U", "d0", "final")
+        c = pm["degree_days_coverage"]
+        check("%d-day temperature gap: %d imputed" % (missing, n_imp), c["n_imputed"] == n_imp, c, ["degree_days"])
+        check("%d-day temperature gap: degree_days %s" % (missing, dd), (pm["degree_days"] is None and dd is None)
+              or close(pm["degree_days"], dd), pm["degree_days"], ["degree_days"])
+
+
+def test_min_recovery_flag():
+    """recovery outside (p:min_recovery, 1] is flagged; default 0.3."""
+    for rec, flagged in ((0.29, True), (0.31, False)):
+        con, ins = rich_db()
+        con.execute("UPDATE recovery_tests SET feed_recovered_dm_g = ? WHERE record_id = 'R1'", (100 * rec,))
+        pm = M.period_metrics(con, "U", "d0", "final")
+        check("recovery %.2f flagged = %s (min 0.3)" % (rec, flagged), close(pm["recovery"], rec)
+              and ("recovery_out_of_range" in pm["flags"]) == flagged, (pm["recovery"], pm["flags"]), ["recovery"])
+
+
+def test_retention_sample_window():
+    """retention: removed fish valued at a unit whole-body sample within p:retention_sample_window_days (2)
+    of the event, else the mean of start and end. rich_db's day-4 final sample is 3 days from the day-1
+    deaths (outside, see test_rich_hand_computed); a whole_body_mid sample 2 days after them is inside."""
+    con, ins = rich_db()
+    ins("composition", record_id="WM", trial_id="T", sample_id="WBM", unit_id="U", sample_type="whole_body_mid",
+        date=day(3), analyte="protein", value=170.0, value_unit="g_kg", basis="wet")
+    ret = 100 * (11.64 * RICH_C_END - 10.0 * 160.0 + 0.2 * 170.0) / RICH_PROT
+    got = F["retention_pct"](con, "U", "d0", "final", "protein")
+    check("retention: whole_body_mid 2 days after the deaths used (window 2)", close(got, ret), (got, ret),
+          ["retention_pct"])
+
+
+def test_uneaten_dm_frac_param():
+    """uneaten_dm = uneaten_wet_g x (row fraction, else the unit's period mean measured fraction, else
+    p:uneaten_dm_frac). Default NULL: needed and NULL -> intake NULL."""
+    con, ins = rich_db()
+    con.execute("UPDATE uneaten_feed SET uneaten_dm_frac = NULL")
+    pm = M.period_metrics(con, "U", "d0", "final")
+    check("no measured uneaten_dm_frac, parameter NULL -> intake NULL", pm["intake_dm_g"] is None,
+          pm["intake_dm_g"], ["intake_dm_g"])
+    ins("validation_params", trial_id="T", param="uneaten_dm_frac", value=0.4)
+    exp = 4 * (90.0 - 4.0 / 0.8)       # 10 g wet x 0.4 = 4 g DM/day; day 3 imputed 90 x 12/270 = 4
+    got = F["intake_dm_g"](con, "U", "d0", "final")
+    check("uneaten_dm_frac 0.4 from validation_params as last fallback", close(got, exp), (got, exp), ["intake_dm_g"])
+    con.execute("UPDATE uneaten_feed SET uneaten_dm_frac = 0.5 WHERE date = ?", (day(0),))
+    got = F["intake_dm_g"](con, "U", "d0", "final")
+    check("measured fraction outranks validation_params", close(got, RICH_INTAKE), (got, RICH_INTAKE), ["intake_dm_g"])
+
+
+def test_dead_weight_ratio_default():
+    """event_biomass_kg of an estimated death x p:dead_weight_ratio, default 1."""
+    con, ins = tiny()
+    final(ins, 10, 98, 12.74)                     # 130 g at day 10
+    ev(ins, "E1", day(5), "mortality", 2, "death", None, ws="estimated_interpolated")
+    exp = 2 * (100.0 * 130.0) ** 0.5 / 1000
+    got = F["event_biomass_kg"](con, "U", "E1")
+    check("event_biomass estimated death x default dead_weight_ratio 1", close(got, exp), (got, exp),
+          ["event_biomass_kg"])
+
+
 if __name__ == "__main__":
     for fn in (test_registry, test_synthetic, test_rich_hand_computed, test_dose_realised, test_fish_level_indices,
                test_weight_basis, test_period_sum_coverage, test_relative_to_weighing, test_recount_reset,
                test_transfer_in_and_estimates, test_kaplan_meier, test_n_fish_d0_from_stocking, test_daylength, test_nh3,
-               test_bulk_lots_with_mean_weight, test_adc_wet_basis_feces):
+               test_bulk_lots_with_mean_weight, test_adc_wet_basis_feces, test_camera_window_and_detections,
+               test_interp_days, test_min_recovery_flag, test_retention_sample_window, test_uneaten_dm_frac_param,
+               test_dead_weight_ratio_default):
         try:
             fn()
         except Exception as e:     # a crash is a failure, keep running the others
