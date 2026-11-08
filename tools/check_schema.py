@@ -13,12 +13,16 @@ import re
 import subprocess
 import sys
 
-import yaml
-
 here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, here)
+from build_db import all_constraints, load_model  # noqa: E402
+
 path = sys.argv[1] if len(sys.argv) > 1 else "data_model.yaml"
-with open(path) as f:
-    model = yaml.safe_load(f)
+try:
+    model = load_model(path)          # rejects duplicate keys (safe_load keeps the last silently)
+except ValueError as e:
+    print(f"YAML: {e}")
+    sys.exit(1)
 
 tables = model["tables"]
 errors = []
@@ -26,11 +30,12 @@ TABLE_KEYS = {"description", "primary_key", "columns", "rules", "tier"}
 COL_KEYS = {"type", "required", "default", "description", "fk", "values", "min", "max"}
 TYPES = {"string", "float", "integer", "boolean", "date", "datetime", "enum"}
 
-constraints = model.get("constraints", [])
+constraints = all_constraints(model)
 cids = [c["id"] for c in constraints]
 if len(cids) != len(set(cids)):
     errors.append("duplicate constraint ids")
 
+OCCASIONS = {"stocking", "d0", "final", "end_early"}   # + mid1..mid99 (constraint C54)
 uniques = {}  # table -> list of column tuples that are unique without a WHERE
 for c in constraints:
     if c["type"] == "unique" and not c.get("where"):
@@ -138,10 +143,11 @@ for rid, text in texts:
     for p in re.findall(r"\bp:([a-z_0-9]+)", text):
         if p not in params:
             errors.append(f"{rid}: unknown validation param p:{p}")
-    for a, b in re.findall(r"\b[CR](\d{2})-[CR]?(\d{2})\b", text):
+    for kind, a, b in re.findall(r"\b([CR])(\d{2})-[CR]?(\d{2})\b", text):
+        pool = cids if kind == "C" else ids
         for n in range(int(a), int(b) + 1):
-            if f"C{n:02d}" not in cids and f"R{n:02d}" not in ids:
-                errors.append(f"{rid}: range cites unknown id {n:02d}")
+            if f"{kind}{n:02d}" not in pool:
+                errors.append(f"{rid}: range cites unknown id {kind}{n:02d}")
     for cid in re.findall(r"\bC(\d{2})\b", text):
         if f"C{cid}" not in cids:
             errors.append(f"{rid}: cites unknown constraint C{cid}")
@@ -156,9 +162,63 @@ for c in constraints:
     vocab = {w.strip() for s in cols if s.get("type") == "string" and "|" in s.get("description", "")
              for w in re.findall(r"[a-z0-9_]+", s["description"].split(":")[-1])}
     for lit in re.findall(r"'([^']*)'", txt):
-        if lit == "" or any(ch in lit for ch in "[]*?:") or lit in enums or lit in vocab:
+        if lit == "" or any(ch in lit for ch in "[]*?:%") or lit in enums or lit in vocab or lit in OCCASIONS:
             continue
         errors.append(f"{c['id']}: literal '{lit}' is not an enum value of {c['table']}")
+for c in constraints:
+    if '"' in (c.get("expr") or "") + (c.get("where") or ""):
+        errors.append(f"{c['id']}: double quote in expression (SQLite would read a misspelt column as a string)")
+
+# rules: enforced_by
+for r in rules:
+    for e in r.get("enforced_by", []) or []:
+        if e not in ("validator", "plan") and e not in cids:
+            errors.append(f"{r['id']}: enforced_by {e} is not a constraint id, validator or plan")
+    if "enforced_by" not in r:
+        errors.append(f"{r['id']}: enforced_by missing")
+
+# event_types: single source must agree with the events enums
+ev = tables.get("events", {}).get("columns", {})
+et = model.get("event_types") or {}
+for t, v in et.items():
+    if t not in ev.get("event_type", {}).get("values", []):
+        errors.append(f"event_types.{t}: not an events.event_type value")
+    if v.get("delta") not in (-1, 1):
+        errors.append(f"event_types.{t}: delta must be -1 or 1")
+    for oc in v.get("outcome_classes", []):
+        if oc not in ev.get("outcome_class", {}).get("values", []):
+            errors.append(f"event_types.{t}: outcome class {oc} not an events.outcome_class value")
+roles = model.get("outcome_class_roles") or {}
+if set(roles) != set(ev.get("outcome_class", {}).get("values", [])):
+    errors.append("outcome_class_roles must list exactly the events.outcome_class values")
+for k, v in roles.items():
+    if v not in ("event", "censored", "addition"):
+        errors.append(f"outcome_class_roles.{k}: role {v} unknown")
+
+# bare identifiers in metric / population / rule texts must name something that exists
+known = set(tables) | set(model.get("derived_metrics", {})) | set(params) | set(et) | set(roles)
+known |= set(model.get("analysis_populations", {})) | set(model)
+known |= OCCASIONS
+for t in tables.values():
+    for cn, sp in t["columns"].items():
+        known.add(cn)
+        known |= set(sp.get("values", []) or [])
+ALLOW = {"temp_range_ok", "w_source", "n_count", "b_count", "n_event", "n_censored", "n_added",
+         "n_eligible", "n_observed", "n_imputed", "coverage_pct", "valid_days", "eligible_days",
+         "fed_dm", "uneaten_dm", "intake_day", "c_dm", "w_start", "w_end", "b_start", "b_end",
+         "c_start", "c_end", "c_i", "t_day", "m_diet", "m_feces", "n_diet", "n_feces", "end_date",
+         "start_date", "d0_date", "unit_day", "event_biomass_kg_i", "has_d0", "has_final",
+         "follow_up_days", "n_occasions", "polar_day", "polar_night", "biomass_gain_estimated_share",
+         "fcr_gross_qc", "split_estimate", "per_type", "role", "day_n", "n_sites", "n_levels",
+         "delta_i", "whole_body"}
+formula_texts = [(r["id"], r["rule"]) for r in rules]
+formula_texts += list(model.get("derived_metrics", {}).items())
+formula_texts += list(model.get("analysis_populations", {}).items())
+for rid, text in formula_texts:
+    for tok in re.findall(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b", text):
+        if tok not in known and tok.lower() not in ALLOW:
+            errors.append(f"{rid}: unknown identifier '{tok}'")
+
 # event-type / outcome-class lists in metric and rule texts
 all_enum_values = {v for t in tables.values() for s in t["columns"].values() if s.get("type") == "enum" for v in s["values"]}
 for rid, text in texts:
@@ -179,7 +239,8 @@ for cname in non_enum:
 eq = re.compile(r"\b([a-z_]+)\s*(?:=|!=)\s*([a-z_0-9]+)\b")
 for rid, text in texts:
     for col, val in eq.findall(text):
-        if col in enum_vals and val not in enum_vals[col] and val not in ("null", "true", "false"):
+        if col in enum_vals and val not in enum_vals[col] and val not in ("null", "true", "false") \
+                and not (col == "role" and val in (model.get("outcome_class_roles") or {}).values()):
             errors.append(f"{rid}: '{col} = {val}' is not a value of enum {col}")
 
 if errors:
@@ -188,8 +249,9 @@ if errors:
 
 n_cols = sum(len(t["columns"]) for t in tables.values())
 n_opt = sum(1 for t in tables.values() if t.get("tier") == "optional")
+n_db = sum(1 for r in rules if r.get("enforced_by") and all(e not in ("validator", "plan") for e in r["enforced_by"]))
 print(f"static OK: {len(tables)} tables ({n_opt} optional), {n_cols} columns, "
-      f"{len(rules)} rules, {len(constraints)} constraints")
+      f"{len(rules)} rules ({n_db} fully enforced by the database), {len(constraints)} constraints")
 for script in ("build_db.py", "test_constraints.py"):
     r = subprocess.run([sys.executable, os.path.join(here, script), path],
                        capture_output=True, text=True)
