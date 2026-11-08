@@ -1,5 +1,5 @@
 # =====================================================================
-# Feed trial data model  (v0.7 – six-expert review, constraints enforced)
+# Feed trial data model  (v0.8 – executable review: synthetic trial + adversarial audit)
 # Atlantic salmon feed trials – tank, RAS and sea-cage, several climates
 #
 # Conventions
@@ -12,11 +12,17 @@
 #   - The EXPERIMENTAL UNIT is the tank/cage (units table), never the fish
 #   - NULL = not measured / not recorded. A NULL is never read as 0, and a default
 #     is never used where "unknown" is a possible truth (blinding, timezone, weight basis).
-#   - Day 0 (d0) = unit_occasions.occasion_date of occasion 'd0' (stocking may precede
-#     d0 by the acclimation period; events before d0 are outside the count balance).
+#   - Day 0 (d0) = unit_occasions.occasion_date of occasion 'd0'. Stocking may precede d0
+#     (acclimation). n_fish(d0) = n_fish of the d0 bulk/stocking row if the stocking row IS
+#     the d0 row; otherwise stocking n_fish + count-changing events with stocking date <= date < d0.
 #   - Growth periods are half-open: feed and degree-days of a period are summed over
 #     (start occasion_date, end occasion_date]. Feed given on a weighing day belongs to
 #     the period that ENDS that day.
+#   - Count-changing EVENTS dated on an occasion_date are taken to happen AFTER that occasion's
+#     weighing: events of a period are those with start_date <= date < end_date. So harvest
+#     n_fish / B_end exclude same-day terminal sampling, and nothing is counted twice.
+#   - The global rule "NULL input -> NULL metric" applies per day/row; period sums use the
+#     coverage rule stated in the metric (sum of non-NULL days, never rescaled).
 #   - record_id is unique per table only; a cross-table reference is (target_table, target_record_id).
 #
 # Tiers: table.tier = core (default) | optional. Optional tables can stay empty in a first
@@ -403,16 +409,18 @@ tables:
   weighings:
     description: >
       Individual (fish_id filled) or bulk (fish_id empty, n_fish and biomass_kg filled)
-      weighings. bulk/stocking/harvest = all fish in the unit counted/weighed; sample =
-      subsample, ONE ROW PER FISH (n_fish NULL). Harvest n_fish is the count BEFORE
-      terminal sampling (sampled fish are removal_sampling events).
+      weighings. bulk/stocking/harvest = all fish in the unit counted/weighed, possibly in
+      several lots (rows) per occasion; on a bulk row weight_g = MEAN weight of the lot.
+      sample = subsample, ONE ROW PER FISH (n_fish NULL). Harvest n_fish is the count BEFORE
+      terminal sampling (sampled fish are removal_sampling events dated the same day,
+      which by convention happen after the weighing).
     primary_key: record_id
     columns:
       record_id:        {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
       unit_id:          {type: string, required: true, fk: units.unit_id}
       occasion:         {type: string, required: true, description: "FK to unit_occasions with unit_id; vocabulary enforced by constraint"}
       date:             {type: date, required: true}
-      time:             {type: string, description: "Local HH:MM (00:00-23:59); resolves same-day order"}
+      time:             {type: string, description: "Local HH:MM zero-padded (00:00-23:59, '09:30' not '9:30'); resolves same-day order"}
       sampling_type:    {type: enum, values: [stocking, individual, bulk, sample, harvest], required: true}
       qc_flag:          {type: enum, values: [raw, ok, suspect, removed], default: raw}
       fish_id:          {type: string, fk: fish.fish_id}
@@ -421,7 +429,7 @@ tables:
       n_fish:           {type: integer, min: 0}
       biomass_kg:       {type: float, min: 0}
       weight_basis:     {type: enum, values: [round, bled, gutted], description: "NULL = unknown (warning); derived weights need round"}
-      fish_fate:        {type: enum, values: [returned, killed], description: "NULL = unknown. killed -> matching events removal_sampling (R14). Harvest rows: killed"}
+      fish_fate:        {type: enum, values: [returned, killed], description: "sample/individual rows only: killed -> matching events removal_sampling (R14). NULL on bulk/stocking/harvest rows"}
       fasted_hours:     {type: float}
       anaesthetic_agent: {type: enum, values: [none, ms222, benzocaine, aqui_s, clove_oil, other]}
       capture_method:   {type: enum, values: [crowd_dipnet, trap, all_fish, other],
@@ -429,14 +437,17 @@ tables:
       sample_depth_m:   {type: float}
       instrument_id:    {type: string, fk: sensors.sensor_id, description: "Scale"}
     rules:
-      - "individual, sample -> weight_g required"
-      - "stocking, bulk, harvest -> n_fish required and (biomass_kg or weight_g) required"
-      - "every unit has exactly one stocking row (stocking occasion) and one d0 occasion; units with termination_reason planned_end have a final occasion"
+      - "individual, sample -> weight_g required; individual -> fish_id required"
+      - "stocking, bulk, harvest -> n_fish > 0 required and (biomass_kg or weight_g) required"
+      - "every unit has exactly one stocking row; its occasion is 'd0' when stocking is day 0, else 'stocking' and a d0 occasion exists; units with termination_reason planned_end have a final occasion"
       - "unit mean weight and biomass: see derived_metrics.unit_weight_g (bulk before individual; removed biomass comes ONLY from events)"
 
   # ---------------------------------------------------------------
   feeding:
-    description: Daily feed per unit and batch.
+    description: >
+      Daily feed per unit and batch (grain: unit x local date x batch; meals are pre-summed
+      by the importer, n_meals keeps the count). A day with no row = not recorded (R07 gap);
+      feed_given_g NULL = fed but amount not recorded (metrics NULL for that day).
     primary_key: [unit_id, date, batch_id]   # a batch change mid-day gives two rows
     columns:
       unit_id:            {type: string, required: true, fk: units.unit_id}
@@ -444,7 +455,7 @@ tables:
       batch_id:           {type: string, required: true, fk: feed_batches.batch_id}
       diet_id:            {type: string, required: true, fk: diets.diet_id,
                            description: "Copy of units.diet_id; composite FKs make a batch of another diet impossible"}
-      feed_given_g:       {type: float, min: 0, required: true}
+      feed_given_g:       {type: float, min: 0, description: "NULL = amount not recorded; a feeding day is a row with feed_given_g > 0"}
       delivery_basis:     {type: enum, values: [metered, split_estimate], description: "split_estimate = barge/pipeline feed split over cages; FCR flagged"}
       ration_type:        {type: enum, values: [ad_libitum, restricted, fixed_pct_bw]}
       ration_pct_bw:      {type: float}
@@ -558,7 +569,7 @@ tables:
                                                 feeding_stop, maturation_observed, algal_bloom, jellyfish, storm, net_change,
                                                 other], required: true}
       outcome_class:      {type: enum, values: [death, cull_moribund, cull_scheduled, sampling, escape, transfer, restock],
-                           description: "Required for count-changing types. Deaths = death + cull_moribund; the rest are censored"}
+                           description: "Required for count-changing types with n_fish > 0; tied to event_type by C83. Deaths = death + cull_moribund; the rest are censored. Direction (in/out) comes from event_type"}
       cause_category:     {type: enum, values: [handling, disease_infectious, disease_noninfectious, nutritional_suspect, environmental, predation, unknown],
                            description: "For cause-specific / competing-risks analysis"}
       humane_endpoint:    {type: boolean, description: "cull because a humane-endpoint criterion was met"}
@@ -572,7 +583,7 @@ tables:
       n_fish_estimated:   {type: boolean, description: "NULL = unknown; true e.g. escape counts"}
       biomass_kg:         {type: float, min: 0, description: "Required when n_fish > 0 unless weight_source is estimated_*"}
       weight_source:      {type: enum, values: [weighed, estimated_last_mean, estimated_interpolated, not_applicable],
-                           description: "estimated_* with biomass NULL -> biomass = n_fish x last unit mean weight; not_applicable for n_fish = 0"}
+                           description: "estimated_last_mean with biomass NULL -> biomass = n_fish x unit_weight_g of the latest occasion before the event; estimated_interpolated -> linear between the surrounding occasions; not_applicable only for n_fish = 0"}
       duration_min:       {type: integer, min: 0}
       selection:          {type: enum, values: [random, size_stratified, all, other],
                            description: "How removal_sampling fish were picked"}
@@ -834,7 +845,7 @@ tables:
       unit_id:            {type: string, fk: units.unit_id}
       fish_id:            {type: string, fk: fish.fish_id}
       target_table:       {type: string, description: "Table of the record concerned, e.g. weighings"}
-      target_record_id:   {type: string, description: "record_id in target_table"}
+      target_record_id:   {type: string, description: "record_id in target_table; tables without record_id (feeding, uneaten_feed, camera_estimates, unit_occasions) are targeted with target_filter"}
       target_filter:      {type: string, description: "Bulk target, e.g. \"environment: sensor_id='S7' AND timestamp BETWEEN ...\""}
       category:           {type: enum, values: [protocol, data_quality, analysis_plan, exclusion]}
       exclusion_scope:    {type: enum, values: [unit, record, fish], description: "Required when category = exclusion"}
@@ -912,6 +923,7 @@ tables:
 constraints:
   # -- unique keys needed as composite FK targets
   - {id: C01, table: units,               type: unique, columns: [trial_id, unit_id]}
+  - {id: C07, table: analysis_plans,      type: unique, columns: [trial_id, plan_id]}
   - {id: C02, table: units,               type: unique, columns: [unit_id, diet_id]}
   - {id: C03, table: diets,               type: unique, columns: [trial_id, diet_id]}
   - {id: C04, table: systems,             type: unique, columns: [trial_id, system_id]}
@@ -928,12 +940,13 @@ constraints:
   - {id: C17, table: feeding,     type: fk, columns: [batch_id, diet_id],   ref_table: feed_batches, ref_columns: [batch_id, diet_id]}
   - {id: C18, table: composition, type: fk, columns: [batch_id, diet_id],   ref_table: feed_batches, ref_columns: [batch_id, diet_id]}
   - {id: C19, table: weighings,   type: fk, columns: [unit_id, occasion],   ref_table: unit_occasions, ref_columns: [unit_id, occasion]}
+  - {id: C21, table: deviations,  type: fk, columns: [trial_id, plan_id],   ref_table: analysis_plans, ref_columns: [trial_id, plan_id]}
   - {id: C20, table: camera_estimates, type: fk, columns: [calibration_id, unit_id, camera_id, algorithm_version],
      ref_table: camera_calibrations, ref_columns: [calibration_id, unit_id, camera_id, algorithm_version]}
   # -- natural keys
   - {id: C30, table: weighings,  type: unique, columns: [unit_id], where: "sampling_type = 'stocking'"}
-  - {id: C31, table: weighings,  type: unique, columns: [unit_id, occasion, sampling_type], where: "sampling_type IN ('stocking','bulk','harvest')"}
-  - {id: C32, table: weighings,  type: unique, columns: [unit_id, occasion, fish_id], where: "fish_id IS NOT NULL AND sampling_type = 'individual'"}
+  - {id: C31, table: weighings,  type: unique, columns: [unit_id, occasion, sampling_type, date, "COALESCE(time,'')"], where: "sampling_type IN ('stocking','bulk','harvest')"}
+  - {id: C32, table: weighings,  type: unique, columns: [unit_id, occasion, fish_id], where: "fish_id IS NOT NULL"}
   - {id: C33, table: diets,      type: unique, columns: [trial_id], where: "control_role = 'reference'"}
   - {id: C34, table: fish,       type: unique, columns: [trial_id, pit_tag]}
   - {id: C35, table: composition, type: unique, columns: [trial_id, sample_id, analyte, replicate_no]}
@@ -947,24 +960,25 @@ constraints:
   - {id: C43, table: factor_levels, type: check, expr: "(unit_id IS NULL) <> (system_id IS NULL)"}
   # -- conditional required fields
   - {id: C50, table: weighings, type: check, expr: "sampling_type NOT IN ('individual','sample') OR weight_g IS NOT NULL"}
-  - {id: C51, table: weighings, type: check, expr: "sampling_type NOT IN ('stocking','bulk','harvest') OR (n_fish IS NOT NULL AND (biomass_kg IS NOT NULL OR weight_g IS NOT NULL))"}
-  - {id: C52, table: weighings, type: check, expr: "occasion IN ('stocking','d0','final') OR occasion GLOB 'mid[0-9]*'"}
-  - {id: C53, table: weighings, type: check, expr: "time IS NULL OR (time GLOB '[0-2][0-9]:[0-5][0-9]' AND substr(time,1,2) < '24')"}
-  - {id: C54, table: unit_occasions, type: check, expr: "occasion IN ('stocking','d0','final') OR occasion GLOB 'mid[0-9]*'"}
+  - {id: C51, table: weighings, type: check, expr: "sampling_type NOT IN ('stocking','bulk','harvest') OR (n_fish IS NOT NULL AND n_fish > 0 AND (biomass_kg IS NOT NULL OR weight_g IS NOT NULL))"}
+  - {id: C52, table: weighings, type: check, expr: "sampling_type <> 'individual' OR fish_id IS NOT NULL"}
+  - {id: C53, table: weighings, type: check, expr: "time IS NULL OR time GLOB '[01][0-9]:[0-5][0-9]' OR time GLOB '2[0-3]:[0-5][0-9]'"}
+  - {id: C54, table: unit_occasions, type: check, expr: "occasion IN ('stocking','d0','final') OR occasion GLOB 'mid[0-9]' OR occasion GLOB 'mid[0-9][0-9]'"}
   - {id: C55, table: events, type: check, expr: "event_type NOT IN ('mortality','removal_sampling','cull','escape','transfer_in','transfer_out','restock') OR n_fish IS NOT NULL"}
-  - {id: C56, table: events, type: check, expr: "event_type NOT IN ('mortality','removal_sampling','cull','escape','transfer_in','transfer_out','restock') OR outcome_class IS NOT NULL"}
-  - {id: C57, table: events, type: check, expr: "event_type NOT IN ('mortality','removal_sampling','cull','escape','transfer_in','transfer_out','restock') OR n_fish = 0 OR biomass_kg IS NOT NULL OR COALESCE(weight_source,'') IN ('estimated_last_mean','estimated_interpolated')"}
+  - {id: C56, table: events, type: check, expr: "event_type NOT IN ('mortality','removal_sampling','cull','escape','transfer_in','transfer_out','restock') OR n_fish = 0 OR outcome_class IS NOT NULL"}
+  - {id: C57, table: events, type: check, expr: "event_type NOT IN ('mortality','removal_sampling','cull','escape','transfer_in','transfer_out','restock') OR (n_fish = 0 AND COALESCE(weight_source,'not_applicable') = 'not_applicable') OR (n_fish > 0 AND (biomass_kg IS NOT NULL OR COALESCE(weight_source,'') IN ('estimated_last_mean','estimated_interpolated')))"}
+  - {id: C83, table: events, type: check, expr: "outcome_class IS NULL OR (event_type = 'mortality' AND outcome_class = 'death') OR (event_type = 'cull' AND outcome_class IN ('cull_moribund','cull_scheduled')) OR (event_type = 'removal_sampling' AND outcome_class = 'sampling') OR (event_type = 'escape' AND outcome_class = 'escape') OR (event_type IN ('transfer_in','transfer_out') AND outcome_class = 'transfer') OR (event_type = 'restock' AND outcome_class = 'restock')"}
   - {id: C58, table: water_samples, type: check, expr: "value IS NOT NULL OR COALESCE(censor,'none') <> 'none'"}
   - {id: C59, table: composition,   type: check, expr: "value IS NOT NULL OR COALESCE(censor,'none') <> 'none'"}
   - {id: C60, table: assay_results, type: check, expr: "value IS NOT NULL OR COALESCE(censor,'none') <> 'none'"}
-  - {id: C61, table: composition,   type: check, expr: "sample_type <> 'diet' OR batch_id IS NOT NULL"}
+  - {id: C61, table: composition,   type: check, expr: "sample_type <> 'diet' OR (batch_id IS NOT NULL AND diet_id IS NOT NULL)"}
   - {id: C62, table: deviations,    type: check, expr: "category <> 'exclusion' OR exclusion_scope IS NOT NULL"}
   - {id: C63, table: deviations,    type: check, expr: "(target_table IS NULL) = (target_record_id IS NULL)"}
   - {id: C64, table: analysis_plans, type: check, expr: "file_hash IS NULL OR length(file_hash) = 64"}
   # -- ranges and order
   - {id: C70, table: camera_distributions, type: check, expr: "bin_upper_g > bin_lower_g"}
   - {id: C71, table: camera_estimates,     type: check, expr: "period_end > period_start"}
-  - {id: C72, table: lice_counts, type: check, expr: "(adult_female IS NULL OR adult_female <= n_fish_sampled) AND (other_mobile IS NULL OR other_mobile <= n_fish_sampled) AND (chalimus IS NULL OR chalimus <= n_fish_sampled)"}
+  - {id: C72, table: lice_counts, type: check, expr: "n_fish_sampled > 0 OR (adult_female IS NULL AND other_mobile IS NULL AND chalimus IS NULL)"}
   - {id: C73, table: trials,   type: check, expr: "end_date IS NULL OR end_date >= start_date"}
   - {id: C75, table: unit_location_history, type: check, expr: "valid_to IS NULL OR valid_to >= valid_from"}
   - {id: C76, table: fish_unit_history,     type: check, expr: "valid_to IS NULL OR valid_to >= valid_from"}
@@ -986,6 +1000,7 @@ validation_params_defaults:   # placeholders; set real values per trial in the p
   min_intake_coverage_pct: 90
   min_recovery: 0.3
   temp_band_width_c: 2
+  base_temp_c: 0
   min_gain_kg: 0
   max_slaughter_lag_days: 1
   interference_distance_m: 50
@@ -999,23 +1014,26 @@ validation_params_defaults:   # placeholders; set real values per trial in the p
 # =====================================================================
 derived_metrics:
   day_since_d0:  "unit_occasions.occasion_date - occasion_date of the unit's d0 occasion (time axis of growth curves)"
-  unit_weight_g: "W(unit, occasion): bulk/harvest/stocking row -> 1000*biomass_kg/n_fish (weight_g if biomass_kg NULL); else mean(weight_g) of individual/sample rows. Only weight_basis = round (else NULL). Bulk takes precedence; individual rows give the SD. Analysis weights = n_weighed (n_fish or row count)."
-  n_at_risk:     "n_at_risk(unit, t) = n_fish(d0) + sum(transfer_in, restock) - sum(death, cull_moribund, cull_scheduled, sampling, escape, transfer_out) over events with d0 < date < t"
-  unit_day_risk: "view per unit-day from d0: n_at_risk, n_death (outcome_class in death, cull_moribund), n_censored (other count-changing); feeds Kaplan-Meier, Cox (frailty) or binomial GLMM"
-  biomass_kg:    "B(unit, occasion) = bulk biomass_kg, else n_at_risk(occasion_date) * unit_weight_g / 1000"
+  unit_weight_g: "W(unit, occasion): bulk/harvest/stocking rows of the occasion -> 1000*sum(B_lot)/sum(n_fish) with B_lot = COALESCE(biomass_kg, n_fish*weight_g/1000); else mean(weight_g) of individual/sample rows. Only weight_basis = round (else NULL). Bulk takes precedence; individual rows give the SD. Analysis weight = sum(n_fish) of bulk rows, else number of individual rows."
+  n_fish_d0:     "n_fish of the stocking row when its occasion is d0; else stocking n_fish + sum over count-changing events with stocking_date <= date < d0_date of (transfer_in + restock - mortality - removal_sampling - cull - escape - transfer_out)"
+  n_at_risk:     "n_at_risk(unit, t) = n_fish_d0 + sum(n_fish of transfer_in, restock) - sum(n_fish of mortality, removal_sampling, cull, escape, transfer_out), by event_type, over events with d0_date <= date < t (events on t happen after the weighing at t)"
+  unit_day_risk: "view per unit-day from d0: n_at_risk at start of day, n_death (outcome_class in death, cull_moribund), n_censored (outcome_class in cull_scheduled, sampling, escape, transfer with event_type transfer_out); transfer_in/restock are additions, not censoring; feeds Kaplan-Meier, Cox (frailty) or binomial GLMM"
+  biomass_kg:    "B(unit, occasion) = sum(B_lot) over bulk/harvest/stocking rows of the occasion, else n_at_risk(occasion_date) * unit_weight_g / 1000"
   sgr_pct_day:   "100 * (ln W_end - ln W_start) / (end_date - start_date); W in g; only for groups at equal start weight and period length; do not compare across temperatures"
-  degree_days:   "sum over calendar days in (start, end] of the local daily mean temperature (time-weighted mean of readings) of units.growth_temp_sensor_id, fallback systems.reference_temp_sensor_id; NULL if fewer than p:min_sensor_coverage_pct of the days have data; no base temperature unless the plan sets one"
+  degree_days:   "sum over calendar days in (start, end] of max(0, T_day - p:base_temp_c). T_day = local daily mean temperature (time-weighted mean of readings; a daily_mean row counts as the day's mean, its timestamp is local noon in UTC): per day, rows with environment.unit_id = unit and variable temp_c (prefer growth_temp_sensor_id if several sensors), else the system's reference_temp_sensor_id, else the system-level temp_c rows (per-day fallback). NULL if fewer than p:min_sensor_coverage_pct of the days have a value; otherwise sum of available days scaled by days/available_days"
   tgc:           "1000 * (W_end^(1/3) - W_start^(1/3)) / degree_days; W in g (kg gives a 10x smaller value). Valid only inside the planned temperature window; flag temp_range_ok = false outside it (Jobling 2003 caution); use as descriptor, infer with models"
   condition_k:   "100 * weight_g / fork_length_cm^3 (individual rows, round basis)"
   density_kg_m3: "B(unit, t) / volume at t (unit_geometry row valid at t, else units.volume_m3). Baseline density = at d0 (confounder); later density is a mediator"
-  biomass_gain_kg: "B_end - B_start + sum(events.biomass_kg for death, cull_*, sampling, escape, transfer in (start,end]) - sum(biomass_kg for transfer_in, restock). Removed biomass comes ONLY from events (weighings.fish_fate is a pointer for R14). NULL if any count-changing event with n_fish > 0 has no biomass and no estimate"
-  intake_dm_g:   "per unit-day: fed_dm = sum over batches(feed_given_g * dm_frac(batch)); uneaten_dm = uneaten_wet_g * uneaten_dm_frac; intake_day = fed_dm - (uneaten_dm / recovery), recovery from recovery_tests matched by unit_type x pellet_mm x temp band (floor(temp_c / p:temp_band_width_c)). Tanks: a feeding day without uneaten_feed row -> intake_day NULL. Period sum is NULL below p:min_intake_coverage_pct day coverage. Flag intake_day < 0 and recovery outside (p:min_recovery, 1]. Cages without collector: no intake, only fcr_gross/apparent"
-  fcr_gross:     "sum(feed_given_g)/1000 / (B_end - B_start); gross: no add-back of dead/removed fish; NULL if gain <= p:min_gain_kg or any suspect/removed/excluded feeding day in the window"
+  biomass_gain_kg: "B_end - B_start + B_removed - B_added over events with start_date <= date < end_date; B_removed = sum(biomass_kg of event_type mortality, cull, removal_sampling, escape, transfer_out), B_added = sum(biomass_kg of transfer_in, restock); biomass_kg of estimated_* events is derived as in events.weight_source. Removed biomass comes ONLY from events (weighings.fish_fate is a pointer for R14). NULL if any count-changing event with n_fish > 0 has neither biomass nor an estimate"
+  recovery:      "one value per unit x period: mean over the recovery_tests rows (feed_recovered_dm_g / feed_in_dm_g each) with the unit's unit_type and the pellet_mm of the batch(es) fed (nearest pellet_mm if no exact match) whose temp_c is within p:temp_band_width_c of the unit's period mean temperature (nearest |temp difference| if none); NULL if no test for that unit_type. Flag recovery outside (p:min_recovery, 1]"
+  intake_dm_g:   "per feeding day (feed_given_g > 0): fed_dm = sum over batches(feed_given_g * dm_frac(batch)); uneaten_dm = uneaten_wet_g * uneaten_dm_frac; intake_day = fed_dm - (uneaten_dm / recovery). Tanks: a feeding day without uneaten_feed row, or with feed_given_g NULL -> intake_day NULL; days with feeding_stopped or feed_given_g = 0 are not feeding days and need no uneaten row. Period intake = sum of non-NULL intake_day (NOT rescaled; this is the coverage rule that overrides the global NULL rule), NULL if non-NULL days < p:min_intake_coverage_pct of feeding days. Flag intake_day < 0. Cages without collector: no intake, only fcr_gross/apparent"
+  fcr_gross:     "sum(feed_given_g)/1000 / (B_end - B_start) over feeding rows with qc_flag in (raw, ok); gross: no add-back of dead/removed fish; NULL if gain <= p:min_gain_kg or any feed_given_g in the window is NULL; qc note fcr_gross_qc = 'has_suspect_day' when a suspect/removed/excluded feeding day was dropped"
   fcr_biological: "intake_dm_g/1000 / biomass_gain_kg (DM feed over wet gain; name the basis when pooling trials); NULL if gain <= p:min_gain_kg. Cages without uneaten data report fcr_apparent = fcr_gross using biomass_gain_kg. Fit feed and gain separately; do not analyse the ratio"
-  fi_pct_bw_day: "100 * intake_dm_g / (mean B over period in kg * 1000 * days)"
+  fi_pct_bw_day: "100 * intake_dm_g / ((B_start + B_end)/2 * 1000 * days)"
   fish_days:     "sum over days of n_at_risk"
-  nutrient_intake_g: "sum over days and batches of fed_dm_g(batch) * C_dm_g_per_kg(batch, analyte) / 1000, then the recovery correction in the same way as intake_dm_g. Leaching changes uneaten feed composition (bias, not noise)"
-  retention_pct: "100 * (B_end*C_end + sum(B_removed_i*C_i) - B_start*C_start) / nutrient_intake_g; C in g per kg WET (convert pct x10; mg_kg /1000; pct_of_fa and mj_kg are not mass: retention of EPA/DHA needs absolute g_kg); C_i = unit whole_body measurement nearest in time, else mean of start and end; C_start from whole_body_initial of the cohort (else trial). Final weight is a covariate (composition is size dependent)"
+  nutrient_intake_g: "sum over feeding days and batches of intake_dm_day(batch) * C_dm(batch, analyte) / 1000; intake_dm_day(batch) = intake_day * fed_dm(batch)/fed_dm (uneaten feed split pro rata over batches); C_dm(batch, analyte) in g per kg DRY MATTER = mean over replicate_no of composition(sample_type = diet, batch_id, analyte) converted: g_kg as is, pct x10, mg_kg /1000; basis dry_matter as is, as_fed / dm_frac(batch); basis wet or unknown -> NULL. Same coverage rule as intake_dm_g. Leaching changes uneaten feed composition (bias, not noise)"
+  protein_intake_g: "nutrient_intake_g with analyte = protein"
+  retention_pct: "100 * (B_end*C_end + sum over removal events i (B_removed_i*C_i) - B_start*C_start) / nutrient_intake_g; B_removed_i = events.biomass_kg (incl. estimated) of mortality, cull, removal_sampling, escape, transfer_out with start_date <= date < end_date; C in g per kg WET (convert pct x10; mg_kg /1000; pct_of_fa and mj_kg are not mass: retention of EPA/DHA needs absolute g_kg); C_i = composition row with the unit_id and sample_type whole_body_final/whole_body_initial dated within 2 days of the event (the removed fish themselves), else (C_start + C_end)/2; C_start from whole_body_initial of the unit's cohort (else trial), C_end from whole_body_final of the unit. Final weight is a covariate (composition is size dependent)"
   protein_retention_per_intake: "retention_pct with analyte = protein"
   per:           "biomass_gain_kg*1000 / protein_intake_g"
   adc_pct:       "100 * (1 - (M_diet / M_feces) * (N_feces / N_diet)); M = analysed marker (diets.marker_analyte), N = nutrient, all four on the SAME basis (basis unknown excluded); diet value weighted by feed eaten in the collection window, lagged by gut transit; dry-matter ADC = 100*(1 - M_diet/M_feces). Requires diets.marker != none (R29), one feces_method per contrast (R30)"
@@ -1024,7 +1042,7 @@ derived_metrics:
   gsi_pct:       "100 * gonad_g / body_weight_g"
   fillet_yield_pct: "100 * fillet_g / body_weight_g"
   lice_af_per_fish: "adult_female / n_fish_sampled"
-  survival_pct:  "100 * (1 - n_death / n_fish(d0)), n_death = death + cull_moribund; the time-to-event analysis uses unit_day_risk"
+  survival_pct:  "100 * (1 - n_death / n_fish_d0) for units without transfer_in/restock, n_death = sum n_fish of events with outcome_class in (death, cull_moribund) and d0_date <= date < end_date; units with additions report survival only from unit_day_risk (time-to-event)"
   daylength_h:   "natural daylength from sites.latitude and date; defined for polar day / polar night (flags polar_day, polar_night when |lat| > 66.5), never NaN; effective variant = including civil twilight"
   nh3_n_mg_l:    "unionised ammonia from tan_n_mg_l, pH, temperature and salinity (pKa(temp, salinity))"
 
@@ -1039,10 +1057,10 @@ analysis_populations:
 #   severity error = blocks the analysis dataset; warning = reported with consequence; info = note
 # =====================================================================
 cross_table_rules:
-  - {id: R01, severity: error,   rule: "every unit has a stocking weighing and a d0 occasion; units with termination_reason planned_end have a final occasion; units without final (early termination) are listed in unit_analysis_status, not silently dropped"}
+  - {id: R01, severity: error,   rule: "every unit has a stocking weighing and a d0 occasion (the stocking row is the d0 row unless acclimation precedes d0); a d0 bulk count is a warning when systems.acclimation_start < start_date and the stocking row is not at d0; units with termination_reason planned_end have a final occasion; units without final (early termination) are listed in unit_analysis_status, not silently dropped"}
   - {id: R02, severity: warning, rule: "design check from design_factors: an assigned_treatment applied_at system needs >= 2 systems per level (else flag no replication); an observed_condition needs >= 2 sites per level (else flag 'confounded with site'); factor_levels exist at the granularity applied_at (site-level levels via systems.site_id); diet is checked from units.diet_id"}
   - {id: R03, severity: error,   rule: "excluded = deviations row category = exclusion with decided_by not null naming unit_id, fish_id, (target_table, target_record_id) or target_filter; decided_by null = pending (included in ITT, flagged); per-diet counts of excluded units and records are reported"}
-  - {id: R04, severity: error,   rule: "count balance per unit from d0: n_fish(d0) + transfer_in + restock - death - cull - sampling - escape - transfer_out = n_fish at the last occasion (tolerance p:n_balance_tolerance_pct); events before d0 (acclimation) are outside the balance; harvest n_fish is before terminal sampling; intermediate bulk recounts reset the running count and the difference is logged in deviations"}
+  - {id: R04, severity: error,   rule: "count balance per unit: n_at_risk(last occasion_date) = n_fish of the last occasion's bulk/harvest rows (tolerance p:n_balance_tolerance_pct); events before d0 only enter n_fish_d0; events dated on the last occasion_date happen after the weighing (harvest n_fish is before terminal sampling); intermediate bulk recounts reset the running count and the difference is logged in deviations"}
   - {id: R05, severity: error,   rule: "unit_weight_g not lower than the previous occasion by more than p:max_negative_growth_pct (no negative growth beyond tolerance)"}
   - {id: R06, severity: warning, rule: "initial weight CV per diet <= p:max_initial_cv_pct and between-diet difference in initial mean <= p:max_initial_mean_diff_pct (check_baseline_balance)"}
   - {id: R07, severity: warning, rule: "feeding rows have no gaps between d0 and units.end_date unless feeding_stopped or a feeding_stop event exists"}
@@ -1052,10 +1070,10 @@ cross_table_rules:
   - {id: R11, severity: warning, rule: "light_regimes cover the whole trial period for every unit/system (gaps or overlaps)"}
   - {id: R12, severity: info,    rule: "blinding_feeders = true but diets.label visible in unit-level exports"}
   - {id: R13, severity: error,   rule: "environment, water_samples, light_regimes, factor_levels: exactly one of unit_id / system_id is filled (constraints C40-C43)"}
-  - {id: R14, severity: error,   rule: "fish_measurements rows and weighings rows with fish_fate = killed have a matching events row removal_sampling on the same unit within p:max_slaughter_lag_days of the date, with n_fish >= rows; weighings sample/harvest rows with fish_fate NULL -> warning"}
+  - {id: R14, severity: error,   rule: "fish_measurements rows and weighings sample/individual rows with fish_fate = killed have a matching events row removal_sampling on the same unit within p:max_slaughter_lag_days of the date, with n_fish >= rows; sample/individual rows with fish_fate NULL -> warning; bulk/stocking/harvest rows are never pointers"}
   - {id: R15, severity: error,   rule: "qc_flag = removed on any record requires a deviations row naming (target_table, target_record_id) or a target_filter that matches the record"}
-  - {id: R16, severity: error,   rule: "count-changing events (mortality, removal_sampling, cull, escape, transfer_in, transfer_out, restock): n_fish, outcome_class required; biomass_kg required when n_fish > 0 unless weight_source is estimated_* (constraints C55-C57)"}
-  - {id: R17, severity: error,   rule: "trial consistency: units, systems, diets, fish, composition, deviations belong to one trial; feeding batch belongs to the unit's diet (constraints C10-C18)"}
+  - {id: R16, severity: error,   rule: "count-changing events (mortality, removal_sampling, cull, escape, transfer_in, transfer_out, restock): n_fish required (C55); n_fish > 0 -> outcome_class matching event_type (C56, C83) and biomass_kg or an estimated_* weight_source (C57); n_fish = 0 -> weight_source not_applicable (C57)"}
+  - {id: R17, severity: error,   rule: "trial consistency: units, systems, diets, fish, composition, deviations (unit and plan) belong to one trial; feeding batch belongs to the unit's diet (constraints C10-C18, C21); factor_levels rows belong to the factor's trial via units/systems (validated, not a DB constraint)"}
   - {id: R18, severity: error,   rule: "rows with fish_id (weighings, fish_measurements, fish_scores, events): unit_id equals the fish's unit at that date (fish.unit_id or fish_unit_history)"}
   - {id: R19, severity: warning, rule: "mortality is recorded daily between d0 and units.end_date: an events row per unit-day, n_fish = 0 with weight_source = not_applicable allowed; a missing day means 'not checked', never 0"}
   - {id: R20, severity: error,   rule: "units.block: one label always means one physical block within the trial; block_scope tells whether it spans systems; a block must not coincide with a whole-plot factor level"}
@@ -1071,4 +1089,5 @@ cross_table_rules:
   - {id: R30, severity: error,   rule: "ADC contrasts only within one feces_method (method is a required factor in ADC models)"}
   - {id: R31, severity: warning, rule: "sea-cage units with different diets within p:interference_distance_m of each other (or adjacent upstream_rank): require (1|cage_group_id) or a spatial term in the plan; cages sharing a water mass are not independent"}
   - {id: R32, severity: warning, rule: "per ethics permit: sum of stocked + restock n_fish <= approved_n_fish (warning at 90 percent)"}
+  - {id: R34, severity: warning, rule: "unit_occasions: seq order equals occasion_date order; stocking (if present) then d0 have the lowest seq, final the highest"}
   - {id: R33, severity: warning, rule: "NULL audit: sites.timezone, trials.blinding_feeders / blinding_assessors / blinding_analysts, weighings.weight_basis, events.n_fish_estimated, composition.basis unknown, fish_scores.assessor_id NULL are listed with their consequence (derived values NULL or excluded)"}

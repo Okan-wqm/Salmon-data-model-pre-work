@@ -138,10 +138,34 @@ for rid, text in texts:
     for p in re.findall(r"\bp:([a-z_0-9]+)", text):
         if p not in params:
             errors.append(f"{rid}: unknown validation param p:{p}")
+    for a, b in re.findall(r"\b[CR](\d{2})-[CR]?(\d{2})\b", text):
+        for n in range(int(a), int(b) + 1):
+            if f"C{n:02d}" not in cids and f"R{n:02d}" not in ids:
+                errors.append(f"{rid}: range cites unknown id {n:02d}")
     for cid in re.findall(r"\bC(\d{2})\b", text):
         if f"C{cid}" not in cids:
             errors.append(f"{rid}: cites unknown constraint C{cid}")
 
+# quoted literals in constraint expressions must be values of an enum column of that table
+# (or a known non-enum literal such as a GLOB pattern or empty string)
+for c in constraints:
+    txt = (c.get("expr") or "") + " " + (c.get("where") or "")
+    cols = tables[c["table"]]["columns"].values()
+    enums = {v for s in cols if s.get("type") == "enum" for v in s["values"]}
+    # controlled vocabularies of string columns are listed in their description ('a | b | c')
+    vocab = {w.strip() for s in cols if s.get("type") == "string" and "|" in s.get("description", "")
+             for w in re.findall(r"[a-z0-9_]+", s["description"].split(":")[-1])}
+    for lit in re.findall(r"'([^']*)'", txt):
+        if lit == "" or any(ch in lit for ch in "[]*?:") or lit in enums or lit in vocab:
+            continue
+        errors.append(f"{c['id']}: literal '{lit}' is not an enum value of {c['table']}")
+# event-type / outcome-class lists in metric and rule texts
+all_enum_values = {v for t in tables.values() for s in t["columns"].values() if s.get("type") == "enum" for v in s["values"]}
+for rid, text in texts:
+    for m in re.finditer(r"(?:event_type|outcome_class)\s+(?:in|of)\s+\(([a-z_, ]+)\)", text):
+        for v in re.split(r",\s*", m.group(1).strip()):
+            if v and v not in all_enum_values and v not in ("transfer", "death"):
+                errors.append(f"{rid}: '{v}' is not an enum value")
 # enum values named in rules as "column = value"
 enum_vals, non_enum = {}, set()
 for tname, t in tables.items():
