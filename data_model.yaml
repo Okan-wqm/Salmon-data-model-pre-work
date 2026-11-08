@@ -47,7 +47,12 @@
 #     valid trial loads and that invalid rows are rejected; tools/check_schema.py checks the
 #     file's internal consistency and runs both.
 #   - Rules (cross_table_rules): each rule states enforced_by = constraint ids, validator
-#     (rule engine, implemented per organisation) or plan (analysis-plan decision).
+#     (tools/validate.py) or plan (analysis-plan decision).
+#   - Metrics: tools/metrics.py is the reference implementation of derived_metrics (METRICS
+#     registry, one function per key). Thresholds: tools/calibrate_params.py estimates
+#     validation_params from historical trials loaded into this schema.
+#   - python3 tools/run_all_tests.py runs the whole chain in dependency order and fails if any
+#     metric, validator rule or constraint is not exercised by a test.
 #
 # Deferred (not modelled): RAS operations log (backwash, ozone, biofilter), diet ingredient
 #   matrix, maturation census table, neighbour-farm exposure series, ontology mapping,
@@ -1137,6 +1142,8 @@ validation_params_defaults:   # placeholders; set real values per trial in the p
   retention_sample_window_days: 2
   camera_window_days: 3
   interference_distance_m: 50
+  dm_frac_tolerance: 0.002      # R23: |dm_frac - analysed dm| allowed (fraction)
+  flatline_min_readings: 4      # R09: identical consecutive readings that count as a flat line
   dead_weight_ratio: 1
   uneaten_dm_frac: null      # must be set per trial when uneaten_dm_frac is not measured
 
@@ -1203,29 +1210,29 @@ analysis_populations:
 #   enforced_by: constraint ids (database), validator (rule engine) or plan (analysis plan)
 # =====================================================================
 cross_table_rules:
-  - {id: R01, severity: error,   enforced_by: [validator], rule: "every unit has a stocking weighing and a d0 occasion; units with termination_reason planned_end have a final occasion; unit_analysis_status lists units without one"}
+  - {id: R01, severity: error,   enforced_by: [validator], rule: "every unit has a stocking weighing and a d0 occasion; units with termination_reason planned_end have a final occasion; other units without a final occasion are listed in unit_analysis_status (warning)"}
   - {id: R02, severity: error,   enforced_by: [validator], rule: "design check from design_factors: an assigned_treatment applied_at system needs >= 2 systems per level; an observed_condition needs >= 2 sites per level. If not met and the factor is a term of a planned_outcomes model -> error (df for the term = n_sites - n_levels <= 0: descriptive only); otherwise warning. factor_levels exist at the granularity applied_at (site-level levels via systems.site_id)"}
   - {id: R03, severity: error,   enforced_by: [validator], rule: "exclusion = deviations row category = exclusion naming unit_id, fish_id, (target_table, target_record_id) or target_filter; populations as in analysis_populations; per-diet counts of excluded units and records are reported"}
-  - {id: R04, severity: error,   enforced_by: [validator], rule: "count balance at every recount: n_at_risk(occasion_date) from the previous count = n_count of the occasion within p:n_balance_tolerance_pct, widened by the n_fish_low..n_fish_high range of estimated events; units with no recount after d0 are listed; differences are logged in deviations and a count_adjustment (unaccounted) event may record them"}
+  - {id: R04, severity: error,   enforced_by: [validator], rule: "count balance at every recount: n_at_risk(occasion_date) from the previous count = n_count of the occasion within p:n_balance_tolerance_pct, widened by the n_fish_low..n_fish_high range of estimated events; units with no recount after d0 are listed (warning); a difference within tolerance is reported (info); differences are logged in deviations and a count_adjustment (unaccounted) event may record them"}
   - {id: R05, severity: error,   enforced_by: [validator], rule: "unit_weight_g not lower than the previous occasion by more than p:max_negative_growth_pct"}
-  - {id: R06, severity: warning, enforced_by: [validator], rule: "baseline balance on unit-level d0 means: each diet vs the reference diet and each whole-plot level vs the others differ by <= p:max_initial_mean_diff_pct; within-unit CV of individual d0 weights <= p:max_initial_cv_pct"}
+  - {id: R06, severity: warning, enforced_by: [validator], rule: "baseline balance on unit-level d0 means: each diet vs the reference diet (relative to the reference mean) and each pair of whole-plot levels (relative to the smaller mean) differ by <= p:max_initial_mean_diff_pct; within-unit CV of individual d0 weights <= p:max_initial_cv_pct"}
   - {id: R07, severity: warning, enforced_by: [validator], rule: "feeding rows have no gaps between d0 and the last occasion unless feeding_stopped or a feeding_stop event exists"}
   - {id: R08, severity: warning, enforced_by: [validator], rule: "tank feeding days have an uneaten_feed row; a recovery_tests row exists for every unit_type x pellet_mm x temperature window used (derived_metrics.recovery)"}
-  - {id: R09, severity: warning, enforced_by: [validator], rule: "environment findings (REPORT ONLY, never writes qc_flag): gaps > p:max_gap_h relative to nominal_interval_min, flat-lined sensors, o2_sat_pct > 150 or < 0, temp jumps > p:max_temp_jump_c_h per hour; flags are applied by the QC step and documented per R15"}
+  - {id: R09, severity: warning, enforced_by: [validator], rule: "environment findings (REPORT ONLY, never writes qc_flag): gaps > p:max_gap_h relative to nominal_interval_min, flat-lined sensors (>= p:flatline_min_readings identical consecutive readings, light variables excluded), o2_sat_pct > 150 or < 0, temp jumps > p:max_temp_jump_c_h per hour; flags are applied by the QC step and documented per R15"}
   - {id: R10, severity: warning, enforced_by: [validator], rule: "camera_estimates: algorithm_version changes without a new camera_calibrations row; algorithm_version unknown; rows without a calibration valid at period_start (local date); n_detections below p:min_detections"}
   - {id: R11, severity: warning, enforced_by: [validator], rule: "light_regimes cover the whole trial period for every unit/system (gaps or overlaps)"}
-  - {id: R12, severity: info,    enforced_by: [validator], rule: "blinding_feeders = true but diets.label visible in unit-level exports"}
+  - {id: R12, severity: info,    enforced_by: [validator], rule: "blinding_feeders = true requires units.diet_code_blind on every unit, different from diets.label and diet_id"}
   - {id: R13, severity: error,   enforced_by: [C40, C41, C42, C43], rule: "environment, water_samples, light_regimes, factor_levels: exactly one of unit_id / system_id is filled"}
-  - {id: R14, severity: error,   enforced_by: [validator], rule: "fish_measurements rows and weighings sample/individual rows with fish_fate = killed have a matching removal_sampling event on the same unit within p:max_slaughter_lag_days, with n_fish >= rows; sample/individual rows with fish_fate NULL -> warning; count rows never carry fish_fate (C66)"}
+  - {id: R14, severity: error,   enforced_by: [validator], rule: "fish_measurements rows and weighings sample/individual rows with fish_fate = killed have a matching removal_sampling or harvest event on the same unit within p:max_slaughter_lag_days, with n_fish >= rows; sample/individual rows with fish_fate NULL -> warning; count rows never carry fish_fate (C66)"}
   - {id: R15, severity: error,   enforced_by: [validator], rule: "qc_flag = removed on any record requires a deviations row naming (target_table, target_record_id) or a target_filter that matches the record"}
   - {id: R16, severity: error,   enforced_by: [C55, C56, C57, C83, C84, C68], rule: "count-changing events as declared in event_types: n_fish required; n_fish > 0 -> allowed outcome_class and biomass or an estimated weight_source; n_fish = 0 -> no biomass and weight_source not_applicable; other event types carry no counts"}
   - {id: R17, severity: error,   enforced_by: [C10, C11, C12, C13, C14, C15, C17, C18, C21, C22, validator], rule: "trial consistency: units, systems, diets, fish, composition, samples and deviations belong to one trial; a feeding row's batch belongs to its diet_id; feeding diet_id belongs to the unit's trial and factor_levels rows to the factor's trial (validator)"}
   - {id: R18, severity: error,   enforced_by: [validator], rule: "rows with fish_id: unit_id equals the fish's unit at that date (fish.unit_id or fish_unit_history, valid_to exclusive); fish-level ITT analyses use fish.unit_id"}
   - {id: R19, severity: warning, enforced_by: [validator], rule: "mortality is recorded daily from d0 to the last occasion_date: an events row per unit-day, n_fish = 0 allowed; a missing day means 'not checked', never 0"}
   - {id: R20, severity: warning, enforced_by: [validator], rule: "blocks: units.block is declared as a design_factors row with role blocking; one label = one physical block; incomplete blocks (not every diet in every block) are flagged; a block must not coincide with an assigned whole-plot level"}
-  - {id: R21, severity: error,   enforced_by: [C33, validator], rule: "dose-response trials: if any diet has dose_value, all diets (incl. control) have dose_value, dose_unit, dose_basis and dose_analyte, and dose_realised is computable (composition basis convertible to dose_basis); max one reference diet"}
+  - {id: R21, severity: error,   enforced_by: [C33, validator], rule: "dose-response trials: if any diet has dose_value, all diets (incl. control) have dose_value, dose_unit, dose_basis and dose_analyte, and dose_realised is computable (composition basis convertible to dose_basis; for dose_basis added, dose_realised = C(diet) - C(the diet with dose_value 0 of the same trial)); max one reference diet"}
   - {id: R22, severity: error,   enforced_by: [C20, validator], rule: "camera_estimates.calibration_id matches unit, camera and algorithm_version (C20) and the local date of period_start falls in valid_from..valid_to"}
-  - {id: R23, severity: warning, enforced_by: [validator], rule: "feed_batches.dm_frac equals composition dm (sample_type = diet) of the same batch_id after unit conversion"}
+  - {id: R23, severity: warning, enforced_by: [validator], rule: "feed_batches.dm_frac equals composition dm (sample_type = diet) of the same batch_id after unit conversion, within p:dm_frac_tolerance"}
   - {id: R24, severity: warning, enforced_by: [validator], rule: "sea_cage trials: environment temp_c / o2 rows have depth_m"}
   - {id: R25, severity: warning, enforced_by: [validator], rule: "composition analysis_run_id is not aliased with diet (via units.diet_id for unit samples), with any assigned factor level, or with system: every run holds more than one level of each"}
   - {id: R26, severity: error,   enforced_by: [validator], rule: "feces samples: the batch(es) fed to the unit in collection_start..collection_end are identifiable; more than one batch -> flag for ADC"}
@@ -1242,5 +1249,5 @@ cross_table_rules:
   - {id: R37, severity: warning, enforced_by: [validator], rule: "tank and RAS units: mortality and cull_moribund events with n_fish > 0 have weight_source = weighed"}
   - {id: R38, severity: error,   enforced_by: [validator], rule: "analysis_runs with purpose primary_locked have run_at <= trials.unblinded_at; otherwise the primary analysis is flagged as unblinded"}
   - {id: R39, severity: warning, enforced_by: [validator], rule: "feeding rows with off_protocol = true or diet_id != units.diet_id need a deviations row (category protocol) for the unit and date"}
-  - {id: R40, severity: warning, enforced_by: [validator], rule: "w_source (count, camera, sample) differs between units of one contrast at the same occasion (measurement method confounded with treatment or site)"}
-  - {id: R41, severity: warning, enforced_by: [validator], rule: "measured system temperature departs from the assigned level / system_setpoints by more than p:temp_band_width_c on more than 10 percent of days"}
+  - {id: R40, severity: warning, enforced_by: [validator], rule: "w_source (count, camera, sample) differs between units of the trial at the same occasion; the finding names any diet, factor level or site the method is confounded with"}
+  - {id: R41, severity: warning, enforced_by: [validator], rule: "measured system temperature departs from the assigned temperature (system_setpoints temp_c rows outside acclimation / ramp, else the factor_levels.numeric_value of the assigned_treatment factor applied to systems whose name contains temp, else systems.target_temp_c) by more than p:temp_band_width_c on more than 10 percent of days"}

@@ -437,15 +437,23 @@ def r04(ctx):
         if d0 is not None and not any(d(o["date"]) > d0 for o, _ in counts):
             ctx.f("R04", "no recount after d0: count balance cannot be checked", u, severity="warning")
         for (po, pn), (co, cn) in zip(counts, counts[1:]):
-            lo = hi = float(pn)
-            for delta, e in _events_window(ctx, u, d(po["date"]), d(co["date"])):
+            # expected = previous count carried forward over the count-changing events between the
+            # two weighings. NOT n_at_risk(occasion_date): that returns the recount itself.
+            evs = _events_window(ctx, u, d(po["date"]), d(co["date"]))
+            exp_n = pn + sum(delta * e["n_fish"] for delta, e in evs)
+            if hasattr(M, "expected_count"):
+                m_exp = M.expected_count(ctx.con, u, co["occasion"])
+                if m_exp is not None:
+                    exp_n = m_exp
+            lo = hi = float(exp_n)
+            for delta, e in evs:     # widen by the n_fish_low..n_fish_high range of estimated events
                 vals = [delta * e["n_fish"]]
                 if e["n_fish_low"] is not None:
                     vals.append(delta * e["n_fish_low"])
                 if e["n_fish_high"] is not None:
                     vals.append(delta * e["n_fish_high"])
-                lo += min(vals)
-                hi += max(vals)
+                lo += min(vals) - delta * e["n_fish"]
+                hi += max(vals) - delta * e["n_fish"]
             lo_t, hi_t = lo * (1 - tol / 100.0), hi * (1 + tol / 100.0)
             exp = "%g" % lo if lo == hi else "%g..%g" % (lo, hi)
             if not lo_t <= cn <= hi_t:
@@ -576,8 +584,8 @@ def r08(ctx):
             "SELECT date FROM uneaten_feed WHERE unit_id = ? AND COALESCE(qc_flag,'raw') <> 'removed'", (u,))}
         miss = sorted(fdays - coll)
         if miss:
-            ctx.f("R08", "%d of %d tank feeding days without uneaten_feed row (not collected; filled by period_sum):"
-                  " %s" % (len(miss), len(fdays), fmt_ranges(ranges(miss))), u)
+            ctx.f("R08", "%d tank feeding day(s) without uneaten_feed row (not collected; filled by period_sum):"
+                  " %s" % (len(miss), fmt_ranges(ranges(miss))), u)
         occs = [o for o in ctx.occ.get(u, []) if ctx.d0(u) and o["date"] >= ctx.d0(u)]
         for po, co in zip(occs, occs[1:]):
             a, b = po["date"], co["date"]
@@ -639,7 +647,7 @@ def r09(ctx):
                     ctx.f("R09", "%s: o2_sat_pct %g outside 0..150" % (name, r["value"]), u,
                           "environment:" + r["record_id"])
         if var not in LIGHT_VARS and interval_h:
-            min_run = max(4, int(math.ceil(gap_h / interval_h)) + 1)
+            min_run = max(int(ctx.p["flatline_min_readings"]), int(math.ceil(gap_h / interval_h)) + 1)
             run = 1
             for i in range(1, len(rs) + 1):
                 if i < len(rs) and rs[i]["value"] == rs[i - 1]["value"]:
@@ -942,10 +950,13 @@ def r21(ctx):
         if miss:
             ctx.f("R21", "dose-response trial: diet %s has no %s" % (did, ", ".join(miss)), record="diets:" + did)
             continue
-        if r["dose_basis"] == "added":
-            ctx.f("R21", "diet %s: dose_basis added cannot be realised from composition (total analysed content);"
-                  " dose_realised NULL" % did, record="diets:" + did)
-            continue
+        if r["dose_basis"] == "added" and r["dose_value"] != 0:
+            # dose_realised = C(diet) - C(the basal diet with dose_value 0 of the same trial)
+            basal = [d for d, x in ctx.diets.items() if d != did and x["dose_value"] == 0]
+            if len(basal) != 1:
+                ctx.f("R21", "diet %s: dose_basis added needs exactly one basal diet with dose_value 0 in the trial"
+                      " (found %d); dose_realised not computable" % (did, len(basal)), record="diets:" + did)
+                continue
         comp = ctx.rows(
             "SELECT c.batch_id, c.value_unit, c.basis, fb.dm_frac FROM composition c JOIN feed_batches fb"
             " ON fb.batch_id = c.batch_id WHERE c.sample_type = 'diet' AND c.diet_id = ? AND c.analyte = ?"
@@ -999,7 +1010,7 @@ def _conv_dm(value, unit, basis):
 
 @rule("R23")
 def r23(ctx):
-    tol = 0.002
+    tol = ctx.p["dm_frac_tolerance"]
     for b in ctx.rows("SELECT fb.batch_id, fb.dm_frac FROM feed_batches fb JOIN diets dt ON dt.diet_id = fb.diet_id"
                       " WHERE dt.trial_id = ? AND fb.dm_frac IS NOT NULL", (ctx.trial_id,)):
         rows = ctx.rows("SELECT value, value_unit, basis, replicate_no, COALESCE(report_revision, 1) rev FROM"

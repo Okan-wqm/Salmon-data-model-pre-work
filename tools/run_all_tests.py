@@ -68,6 +68,10 @@ def coverage():
 
 
 def main():
+    # coverage records must come from THIS run, never from an earlier one
+    for f in os.listdir(HERE):
+        if f.startswith(".coverage_") and f.endswith(".json"):
+            os.remove(os.path.join(HERE, f))
     for name, (script, *args) in STEPS:
         if not os.path.exists(os.path.join(HERE, script)):
             print("FAIL %-11s missing %s" % (name, script))

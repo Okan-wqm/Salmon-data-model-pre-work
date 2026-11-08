@@ -41,6 +41,8 @@ def ins(con, table, **row):
 def plan(con, model_text, error_strata="system", outcome="sgr_pct_day", label="o1", **extra):
     if not con.execute("SELECT 1 FROM analysis_plans WHERE plan_id = 'P1'").fetchone():
         ins(con, "analysis_plans", plan_id="P1", trial_id=TRIAL, version="1")
+        # a harmless covariate role, so R28 is checked (not 'no plan rows') in every plan mutation
+        ins(con, "covariate_roles", plan_id="P1", variable="w_d0", role="precision", measured="baseline")
     ins(con, "planned_outcomes", plan_id="P1", outcome_label=label, outcome=outcome, role="primary",
         unit_of_analysis="unit", model=model_text, error_strata=error_strata, **extra)
 
@@ -77,6 +79,13 @@ def m_r17(con):
     ins(con, "factor_levels", record_id="FL_X", factor_id="F_TEMP", system_id="SYX", level="12C", numeric_value=12.0)
 
 
+def m_r02_warning(con):
+    ins(con, "design_factors", factor_id="F_PHOTO", trial_id=TRIAL, name="photoperiod", role="assigned_treatment",
+        applied_at="system", level_type="categorical")
+    for s in ("SY1", "SY2", "SY3", "SY4"):
+        ins(con, "factor_levels", record_id="FLP_" + s, factor_id="F_PHOTO", system_id=s, level="A" if s == "SY2" else "B")
+
+
 def m_r02_error(con):
     ins(con, "design_factors", factor_id="F_CLIM", trial_id=TRIAL, name="site_climate", role="observed_condition",
         applied_at="site", level_type="categorical")
@@ -90,11 +99,9 @@ def m_fish(con, fate=None, fate_date=None):
 
 
 MUTATIONS = [
-    ("R01", None, "delete U1D1 stocking weighing",
-     lambda c: c.execute("DELETE FROM weighings WHERE record_id = 'U1D1_STOCK'")),
-    ("R02", "warning", "SY2 moved to 16C: 12C has a single system (factor not in a plan)",
-     lambda c: c.execute("UPDATE factor_levels SET level = '16C', numeric_value = 16, level_order = 2, is_reference = 0"
-                         " WHERE system_id = 'SY2'")),
+    ("R01", None, "delete U2D1 stocking weighing (d0 bulk count remains)",
+     lambda c: c.execute("DELETE FROM weighings WHERE record_id = 'U2D1_STOCK'")),
+    ("R02", "warning", "system-level photoperiod with level A on SY2 only (factor not in a plan)", m_r02_warning),
     ("R02", None, "observed site_climate with one site per level, used in a planned model", m_r02_error),
     ("R03", None, "exclusion with scope record naming nothing",
      lambda c: ins(c, "deviations", record_id="DEVX", trial_id=TRIAL, date=day(10), category="exclusion",
@@ -141,12 +148,16 @@ MUTATIONS = [
      lambda c: c.execute("UPDATE units SET block = 'BX' WHERE unit_id = 'U1D2'")),
     ("R21", None, "dose_value on D2 only",
      lambda c: c.execute("UPDATE diets SET dose_value = 1.0 WHERE diet_id = 'D2'")),
+    ("R21", None, "dose_basis added on both diets, no basal diet with dose 0",
+     lambda c: c.execute("UPDATE diets SET dose_value = CASE diet_id WHEN 'D1' THEN 1.0 ELSE 2.0 END,"
+                         " dose_unit = 'g_kg', dose_basis = 'added', dose_analyte = 'protein'")),
     ("R22", None, "camera estimate outside its calibration window",
      lambda c: (calib(c, "CAL1", "U1D1", 0, 20), camera(c, "U1D1", 59, cal="CAL1"))),
     ("R23", None, "D1_B1 dm_frac 0.85 vs analysed 0.92",
      lambda c: c.execute("UPDATE feed_batches SET dm_frac = 0.85 WHERE batch_id = 'D1_B1'")),
-    ("R24", None, "SY1 declared sea_cage, temperatures without depth",
-     lambda c: c.execute("UPDATE systems SET system_kind = 'sea_cage' WHERE system_id = 'SY1'")),
+    ("R24", None, "sea_cage trial (SY1 system_kind NULL), temperatures without depth",
+     lambda c: (c.execute("UPDATE trials SET system_type = 'sea_cage'"),
+                c.execute("UPDATE systems SET system_kind = NULL WHERE system_id = 'SY1'"))),
     ("R25", None, "U1D1 feces analysed in a run of its own",
      lambda c: c.execute("UPDATE composition SET analysis_run_id = 'RUN_X' WHERE sample_id = 'FEC_U1D1'")),
     ("R26", "warning", "U1D1 feces collection spans the batch change",
@@ -196,6 +207,16 @@ MUTATIONS = [
 ]
 
 
+NEGATIVE = [
+    ("R21", "dose_basis added with D1 as basal diet (dose 0) and D2 dosed",
+     lambda c: c.execute("UPDATE diets SET dose_value = CASE diet_id WHEN 'D1' THEN 0 ELSE 2.0 END,"
+                         " dose_unit = 'g_kg', dose_basis = 'added', dose_analyte = 'protein'")),
+    ("R21", "dose_basis total_dm on both diets with analysed protein",
+     lambda c: c.execute("UPDATE diets SET dose_value = CASE diet_id WHEN 'D1' THEN 1.0 ELSE 2.0 END,"
+                         " dose_unit = 'g_kg', dose_basis = 'total_dm', dose_analyte = 'protein'")),
+]
+
+
 def key(f):
     return (f["rule"], f["severity"], f["unit_id"], f["record"], f["message"])
 
@@ -230,7 +251,7 @@ def main():
     base = {key(f) for f in clean}
 
     # 2. mutations
-    exercised = set()
+    exercised, collateral = set(), {}
     for rid, want, desc, fn in MUTATIONS:
         expected = want or sev[rid]
         c = copy(con)
@@ -250,13 +271,30 @@ def main():
                                     "  [collateral: %s]" % ", ".join(other) if other else ""))
         if ok:
             print("       -> %s" % hit[0]["message"][:140])
-            exercised.add(rid)
+            if other:
+                collateral.setdefault(rid, other)
+            else:
+                exercised.add(rid)          # exactly this rule fired, with the expected severity
         else:
             fails.append("%s mutation '%s': no new %s finding; new: %s" % (
                 rid, desc, expected, [(f["rule"], f["severity"], f["message"][:80]) for f in new]))
-    missing = sorted(set(vrules) - exercised)
+    waived = {r: "every mutation that fires it also fires %s (inherent overlap)" % ", ".join(collateral[r])
+              for r in collateral if r not in exercised}
+    missing = sorted(set(vrules) - exercised - set(waived))
     if missing:
         fails.append("validator rules without a passing mutation: %s" % ", ".join(missing))
+    for r, why in sorted(waived.items()):
+        print("waived %s: %s" % (r, why))
+
+    # 2b. negative mutations: legitimate changes that must NOT make the rule fire
+    for rid, desc, fn in NEGATIVE:
+        c = copy(con)
+        fn(c)
+        c.commit()
+        new = [f for f in V.validate(c, model, TRIAL) if key(f) not in base and f["rule"] == rid]
+        print("%s %s must stay silent: %s" % ("ok  " if not new else "FAIL", rid, desc))
+        if new:
+            fails.append("%s fired on a legitimate change '%s': %s" % (rid, desc, new[0]["message"][:100]))
 
     # 3. metrics module unavailable -> info, no crash
     saved = V.M
@@ -273,7 +311,7 @@ def main():
         V.M = saved
 
     with open(os.path.join(HERE, ".coverage_rules.json"), "w") as f:
-        json.dump({"exercised": sorted(exercised), "waived": {}}, f)
+        json.dump({"exercised": sorted(exercised), "waived": waived}, f, indent=1)
 
     if fails:
         print("\nFAILURES:")
@@ -281,8 +319,8 @@ def main():
             print("  " + x)
         print("FAILED: %d problem(s)" % len(fails))
         return 1
-    print("all %d validator rules fire on their mutation (%d mutations); clean trial has no error" % (
-        len(exercised), len(MUTATIONS)))
+    print("%d/%d validator rules fire alone on a mutation (%d mutations, %d waived); clean trial has no error" % (
+        len(exercised), len(vrules), len(MUTATIONS), len(waived)))
     return 0
 
 

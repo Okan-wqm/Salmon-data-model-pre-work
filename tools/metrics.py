@@ -264,6 +264,13 @@ def n_at_risk(con, unit_id, date_iso):
     return _Unit(con, unit_id).n_at(_d(date_iso))
 
 
+def expected_count(con, unit_id, occasion):
+    """Running total at `occasion`'s weighing carried forward from the PREVIOUS count occasion
+    (latest count occasion dated strictly before it) plus delta * n_fish of the events between the
+    two weighing slots: what a recount at `occasion` should show (R04). None without an earlier count."""
+    return _Unit(con, unit_id).expected_count(occasion)
+
+
 def w_interp(con, unit_id, date_iso):
     return _Unit(con, unit_id).w_interp(_d(date_iso))
 
@@ -348,6 +355,16 @@ class _Unit:
         if c["date"] == t:
             return c["n"]
         return c["n"] + sum(e["delta"] * e["n_fish"] for e in self.events_between(c["date"], t))
+
+    def expected_count(self, occasion):
+        o = self.occ(occasion)
+        if o is None:
+            return None
+        prev = [c for c in self.counts if c["date"] < o["date"]]
+        if not prev:
+            return None
+        c = max(prev, key=lambda c: (c["date"], c["seq"]))
+        return c["n"] + sum(e["delta"] * e["n_fish"] for e in self.events_between(c["date"], o["date"]))
 
     def n_d0(self):
         d0 = self.occ("d0")
@@ -1294,15 +1311,33 @@ _DOSE_UNIT_FROM_G_KG = {"g_kg": 1.0, "mg_kg": 1000.0, "pct": 0.1}
 def dose_realised(con, diet_id):
     """C_dm(batch, dose_analyte) weighted by fed_dm over all feeding rows of the diet in the trial,
     converted to dose_basis (total_dm as is; total_as_fed x dm_frac(batch), batch by batch before
-    weighting) and to dose_unit (g_kg, mg_kg or pct). dose_basis 'added' is not derivable from
-    composition -> NULL (R21)."""
+    weighting) and to dose_unit (g_kg, mg_kg or pct). dose_basis 'added': C(diet) - C(the basal
+    diet with dose_value 0 of the same trial), both on a dry-matter basis (R21); NULL if there is
+    not exactly one basal diet or either value is not computable."""
     cur = con.cursor()
     cur.row_factory = sqlite3.Row
-    dt_ = cur.execute("SELECT trial_id, dose_analyte, dose_basis, dose_unit FROM diets WHERE diet_id = ?",
+    dt_ = cur.execute("SELECT trial_id, dose_analyte, dose_basis, dose_unit, dose_value FROM diets WHERE diet_id = ?",
                       (diet_id,)).fetchone()
-    if dt_ is None or not dt_["dose_analyte"] or dt_["dose_basis"] not in ("total_dm", "total_as_fed") \
-            or dt_["dose_unit"] not in _DOSE_UNIT_FROM_G_KG:
+    if dt_ is None or not dt_["dose_analyte"] or dt_["dose_unit"] not in _DOSE_UNIT_FROM_G_KG:
         return None
+    if dt_["dose_basis"] == "added":
+        if dt_["dose_value"] == 0:
+            return 0.0
+        basal = [r[0] for r in con.execute("SELECT diet_id FROM diets WHERE trial_id = ? AND dose_value = 0 AND diet_id <> ?",
+                                           (dt_["trial_id"], diet_id))]
+        if len(basal) != 1:
+            return None
+        a = _dose_total_g_kg(con, diet_id, dt_["trial_id"], dt_["dose_analyte"], "total_dm")
+        b = _dose_total_g_kg(con, basal[0], dt_["trial_id"], dt_["dose_analyte"], "total_dm")
+        return None if a is None or b is None else (a - b) * _DOSE_UNIT_FROM_G_KG[dt_["dose_unit"]]
+    if dt_["dose_basis"] not in ("total_dm", "total_as_fed"):
+        return None
+    v = _dose_total_g_kg(con, diet_id, dt_["trial_id"], dt_["dose_analyte"], dt_["dose_basis"])
+    return None if v is None else v * _DOSE_UNIT_FROM_G_KG[dt_["dose_unit"]]
+
+
+def _dose_total_g_kg(con, diet_id, trial_id, analyte, basis):
+    """fed_dm-weighted analysed content (g/kg) of one diet on basis total_dm or total_as_fed."""
     frows = _rows(con, "feeding", "diet_id = ? AND feed_given_g > 0", (diet_id,))
     if not frows:
         return None
@@ -1312,15 +1347,15 @@ def dose_realised(con, diet_id):
     flags = set()
     num = den = 0.0
     for bid in sorted({r["batch_id"] for r in frows}):
-        dm = _batch_dm(con, batches, bid, dt_["trial_id"], s, e, flags)
-        c = _c_dm(con, batches, bid, dt_["dose_analyte"], dt_["trial_id"], s, e, flags)
+        dm = _batch_dm(con, batches, bid, trial_id, s, e, flags)
+        c = _c_dm(con, batches, bid, analyte, trial_id, s, e, flags)
         if dm is None or c is None:
             return None
         fed_dm = sum(r["feed_given_g"] for r in frows if r["batch_id"] == bid) * dm
-        v = c if dt_["dose_basis"] == "total_dm" else c * dm
+        v = c if basis == "total_dm" else c * dm
         num += v * fed_dm
         den += fed_dm
-    return num / den * _DOSE_UNIT_FROM_G_KG[dt_["dose_unit"]] if den > 0 else None
+    return num / den if den > 0 else None
 
 
 def nh3_n_mg_l(tan_n_mg_l, ph, temp_c, salinity_ppt=0.0):

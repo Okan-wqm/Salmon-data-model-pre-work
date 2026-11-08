@@ -7,8 +7,9 @@ support.
 
 - `data_model.yaml`: the schema (v0.9). It has 47 tables (19 optional), 69 database
   constraints, 41 cross-table rules and one written definition for every response metric.
-- `tools/`: the tooling that turns the schema into a database and tests it (see
-  [Validation](#validation)).
+- `tools/`: the database builder, the reference implementation of every metric, the rule
+  engine, threshold calibration and the tests that prove them (see
+  [Tools and validation](#tools-and-validation)).
 
 ## Why a dedicated model
 
@@ -34,34 +35,37 @@ the data do or do not record. The model therefore makes these questions explicit
 - **Ordinal welfare and quality scores:** cumulative link models, with defined scales and rater identity.
 - **Multi-site and multi-trial pooling:** site and climate covariates, cross-trial formulation IDs, and pre-registered outcomes with power inputs (`planned_outcomes`).
 
-## Validation
+## Tools and validation
+
+| Tool | What it does |
+|---|---|
+| `tools/build_db.py` | Builds the schema into SQLite STRICT tables with every type, vocabulary, range, date format, composite key and rule constraint |
+| `tools/metrics.py` | Reference implementation of every metric in `derived_metrics` (growth, degree-days, FCR, intake, digestibility, retention, survival, organ indices, unionised ammonia, daylength) and the one-row-per-unit ITT analysis dataset |
+| `tools/validate.py` | Rule engine for the 39 cross-table rules that need more than a database constraint; findings by severity, thresholds per trial |
+| `tools/calibrate_params.py` | Estimates the rule thresholds and power inputs (within- and between-unit CV, ICC) from an organisation's historical trials |
+| `tools/synthetic_trial.py` | A RAS split-plot trial (2 temperatures × 2 diets, 8 tanks, 84 days) with known true values, used by the tests |
 
 ```bash
-python3 tools/check_schema.py data_model.yaml
+python3 tools/run_all_tests.py data_model.yaml
 ```
 
-This single command runs three steps:
+This runs the steps below as one chain, in dependency order, and stops at the first failure.
 
-1. **Static consistency.**
-   - Every column, rule reference, constraint id and threshold parameter named in the text must exist.
-   - Enum defaults must be valid values.
-   - Foreign-key targets must be keys.
-   - Duplicate YAML keys are rejected.
-2. **Database build.** `tools/build_db.py` creates SQLite STRICT tables with types, required
-   fields, vocabularies, ranges, ISO date formats, composite keys (trial and diet
-   consistency) and the constraints generated from the single list of count-changing events.
-3. **Constraint proof.** `tools/test_constraints.py` loads a valid mini-trial and shows that
-   74 deliberately invalid rows are rejected, each by the intended constraint. Examples:
-   - a unit linked to another trial's diet;
-   - text in a numeric field;
-   - a date like `01.02.2025`;
-   - a dead fish with neither a weight nor an estimate.
+1. **Schema.** Every name used in a rule, metric or threshold must exist.
+2. **Database.** The schema builds into a database.
+3. **Constraints.** 92 invalid rows must be rejected. Each one is also rebuilt without its own target check and must then be accepted, which proves the rejection comes from that check and not an unrelated one.
+4. **Synthetic trial.** 3,699 rows load under all constraints.
+5. **Metrics.** All 38 metrics are compared with known true values or hand calculations (277 checks). Biological FCR, intake, protein intake, gain and survival agree with the truth to within 0.01 %.
+6. **Rules.** The clean trial produces no errors. For each of the 39 validator rules there is a change to a copy of the trial that makes exactly that rule fire with the declared severity. Legitimate changes are also checked to stay silent.
+7. **Thresholds.** The estimates recover the variation built into the data, detect an injected 3 % recount error, and are withheld when there are too few observations.
+8. **Coverage gate.** The chain fails if any metric, validator rule or constraint is not exercised by a test. Adding an untested metric, rule or constraint to the schema breaks it.
+
+The same chain runs on every push (`.github/workflows/tests.yml`).
 
 During development the schema was also run end to end on synthetic trials with known true
 effects:
 
-- a tank trial;
-- a RAS split-plot dose-response trial (3 temperatures × 4 lysine levels, PIT-tagged fish);
+- a RAS split-plot dose-response trial with model fitting;
 - a three-site sea-cage trial from 59°N to 70°N;
 - an ingestion test on realistic exports from farm, feeding-system, camera and lab software.
 
@@ -87,9 +91,11 @@ organisation's own sources and existing models:
 
 ## Limitations
 
-- **Cross-table rules.** 39 of the 41 rules need a validator or an analysis-plan decision;
-  only R13 and R16 are fully enforced by the database.
-- **Metric definitions.** Metrics are defined in precise prose; a reference implementation
-  in code is the next step.
+- **Synthetic tests.** The tests prove that the definitions are implemented as written and
+  that every check works. They cannot prove that the definitions suit a given organisation's
+  data; that comes from mapping real exports and calibrating thresholds on historical trials.
+- **Plan rules.** Rules R28, R30, R35 and R38 are checked only when the analysis plan is
+  recorded in `planned_outcomes` / `covariate_roles` / `analysis_runs`.
+- **Free-text parsing.** These rules read the model formula and error strata from text.
 - **Deferred items.** These are listed in the schema header: RAS operations log, diet
   ingredient matrix and others.

@@ -252,3 +252,4 @@ if __name__ == "__main__":
     print("loaded:", {k: v for k, v in rows.items() if v})
     print(json.dumps({u: {k: round(v, 3) if isinstance(v, float) else v for k, v in t.items()}
                       for u, t in list(truth.items())[:2]}, indent=1))
+    print("synthetic trial loaded under all constraints: %d units, %d rows" % (len(truth), sum(rows.values())))
