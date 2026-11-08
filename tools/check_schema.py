@@ -212,7 +212,7 @@ ALLOW = {"temp_range_ok", "w_source", "n_count", "b_count", "n_event", "n_censor
          "start_date", "d0_date", "unit_day", "event_biomass_kg_i", "has_d0", "has_final",
          "follow_up_days", "n_occasions", "polar_day", "polar_night", "biomass_gain_estimated_share",
          "fcr_gross_qc", "split_estimate", "per_type", "role", "day_n", "n_sites", "n_levels",
-         "delta_i", "whole_body"}
+         "delta_i", "whole_body", "placeholder_from_unfed_batches", "nutrient_composition_missing"}
 formula_texts = [(r["id"], r["rule"]) for r in rules]
 formula_texts += list(model.get("derived_metrics", {}).items())
 formula_texts += list(model.get("analysis_populations", {}).items())
