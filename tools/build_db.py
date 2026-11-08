@@ -93,13 +93,19 @@ def all_constraints(model):
     return list(model.get("constraints", [])) + generated_constraints(model)
 
 
-def column_ddl(cname, spec):
+def column_ddl(cname, spec, tname="", drop=frozenset()):
+    """drop: set of switches used by the tests to prove that a rejection is caused by one
+    specific check: 'col:<table>.<column>' (all column CHECKs), 'required:<table>.<column>',
+    'fk:<table>.<column>', 'strict', constraint ids, 'fk_enforcement'."""
     c = q(cname)
+    key = "%s.%s" % (tname, cname)
     parts = [c, TYPE_MAP[spec["type"]]]
-    if spec.get("required"):
+    if spec.get("required") and "required:" + key not in drop:
         parts.append("NOT NULL")
     if "default" in spec:
         parts.append("DEFAULT " + lit(spec["default"]))
+    if "col:" + key in drop:
+        return " ".join(parts)
     t = spec["type"]
     if t == "enum":
         parts.append("CHECK (%s IN %s)" % (c, in_list(spec["values"])))
@@ -118,17 +124,17 @@ def column_ddl(cname, spec):
     return " ".join(parts)
 
 
-def build_ddl(model):
+def build_ddl(model, drop=frozenset()):
     tables = model["tables"]
-    cons = all_constraints(model)
+    cons = [c for c in all_constraints(model) if c["id"] not in drop]
     stmts, post = [], []
     for tname, t in tables.items():
-        lines = [column_ddl(c, s) for c, s in t["columns"].items()]
+        lines = [column_ddl(c, s, tname, drop) for c, s in t["columns"].items()]
         pk = t["primary_key"]
         pk = pk if isinstance(pk, list) else [pk]
         lines.append("PRIMARY KEY (%s)" % ", ".join(q(c) for c in pk))
         for c, s in t["columns"].items():
-            if s.get("fk"):
+            if s.get("fk") and "fk:%s.%s" % (tname, c) not in drop:
                 ft, fc = s["fk"].split(".")
                 lines.append("FOREIGN KEY (%s) REFERENCES %s (%s)" % (q(c), q(ft), q(fc)))
         for c in cons:
@@ -145,15 +151,16 @@ def build_ddl(model):
                 where = " WHERE " + c["where"] if c.get("where") else ""
                 post.append("CREATE UNIQUE INDEX %s ON %s (%s)%s" % (
                     "ux_" + c["id"].lower(), q(tname), ", ".join(c["columns"]), where))
-        stmts.append("CREATE TABLE %s (\n  %s\n) STRICT" % (q(tname), ",\n  ".join(lines)))
+        strict = "" if "strict" in drop else " STRICT"
+        stmts.append("CREATE TABLE %s (\n  %s\n)%s" % (q(tname), ",\n  ".join(lines), strict))
     return stmts + post
 
 
-def build(path="data_model.yaml", db=":memory:"):
-    model = load_model(path)
+def build(path="data_model.yaml", db=":memory:", drop=frozenset(), model=None):
+    model = model or load_model(path)
     con = sqlite3.connect(db)
-    con.execute("PRAGMA foreign_keys = ON")
-    for stmt in build_ddl(model):
+    con.execute("PRAGMA foreign_keys = %s" % ("OFF" if "fk_enforcement" in drop else "ON"))
+    for stmt in build_ddl(model, drop):
         con.execute(stmt)
     return con, model
 

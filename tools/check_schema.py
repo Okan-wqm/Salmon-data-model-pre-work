@@ -17,7 +17,9 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, here)
 from build_db import all_constraints, load_model  # noqa: E402
 
-path = sys.argv[1] if len(sys.argv) > 1 else "data_model.yaml"
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+STATIC_ONLY = "--static-only" in sys.argv
+path = args[0] if args else "data_model.yaml"
 try:
     model = load_model(path)          # rejects duplicate keys (safe_load keeps the last silently)
 except ValueError as e:
@@ -252,6 +254,8 @@ n_opt = sum(1 for t in tables.values() if t.get("tier") == "optional")
 n_db = sum(1 for r in rules if r.get("enforced_by") and all(e not in ("validator", "plan") for e in r["enforced_by"]))
 print(f"static OK: {len(tables)} tables ({n_opt} optional), {n_cols} columns, "
       f"{len(rules)} rules ({n_db} fully enforced by the database), {len(constraints)} constraints")
+if STATIC_ONLY:
+    sys.exit(0)
 for script in ("build_db.py", "test_constraints.py"):
     r = subprocess.run([sys.executable, os.path.join(here, script), path],
                        capture_output=True, text=True)
