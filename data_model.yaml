@@ -1,0 +1,413 @@
+# =====================================================================
+# Feed trial data model  (v0.5 – fourth review)
+# Atlantic salmon feed trials – tank, RAS and sea-cage
+#
+# Conventions
+#   - Column names: snake_case, unit suffix where relevant
+#     (_g, _kg, _cm, _m, _m3, _c = °C, _pct = %, _mg_l, _ppt)
+#   - Timestamps UTC (YYYY-MM-DDTHH:MM:SSZ). Dates (feeding.date, weighings.date, ...)
+#     are LOCAL calendar dates in sites.timezone; daily aggregation of sensor data
+#     must also use local time, otherwise feeding days and daylength misalign.
+#   - Every row is traceable to a unit_id; unit_id is unique across trials
+#   - The EXPERIMENTAL UNIT is the tank/cage (units table), never the fish
+# =====================================================================
+
+tables:
+
+  # ---------------------------------------------------------------
+  trials:
+    description: One row per trial.
+    primary_key: trial_id
+    columns:
+      trial_id:        {type: string, required: true}
+      title:           {type: string}
+      species:         {type: string, default: "Salmo salar"}
+      strain:          {type: string, description: "Genetic origin / supplier"}
+      ploidy:          {type: enum, values: [diploid, triploid]}
+      life_stage:      {type: enum, values: [parr, smolt, post_smolt, grow_out]}
+      system_type:     {type: enum, values: [tank_flowthrough, ras, sea_cage]}
+      facility:        {type: string}
+      start_date:      {type: date, required: true}
+      end_date:        {type: date}
+      acclimation_start: {type: date, description: "Fish at trial conditions before start_date"}
+      ethics_permit:   {type: string, description: "FOTS / Mattilsynet ID"}
+      plan_file:       {type: string, description: "Path to analysis_plan.yaml"}
+      # Thorarensen et al. 2015: MDD < 10 % was reachable only with a narrow initial size
+      # range; beyond ~100 fish/tank, extra replicates help more than extra fish
+      selection_method:      {type: enum, values: [none, size_graded, hand_selected]}
+      initial_weight_min_g:  {type: float}
+      initial_weight_max_g:  {type: float}
+      target_end_rule:       {type: string, description: "e.g. '>= 2x initial weight' (Glencross 2007)"}
+      diet_blinding:         {type: boolean, default: false, description: "Diet codes hidden from feeders/samplers"}
+
+  # ---------------------------------------------------------------
+  sites:
+    description: Locations (sea sites or land facilities).
+    primary_key: site_id
+    columns:
+      site_id:          {type: string, required: true}
+      name:             {type: string}
+      latitude:         {type: float}
+      longitude:        {type: float}
+      region:           {type: enum, values: [north, mid, south]}
+      timezone:         {type: string, default: "Europe/Oslo"}
+      production_area:  {type: integer, min: 1, max: 13, description: "Norwegian production area (PO)"}
+
+  # ---------------------------------------------------------------
+  systems:
+    description: >
+      Physical system that applies a whole-plot treatment (e.g. one
+      temperature-controlled RAS loop or room). Needed to detect
+      split-plot structure. In sea-cage trials: one system per site per trial
+      (system_id must not simply reuse site_id, a site can host several trials).
+    primary_key: system_id
+    columns:
+      system_id:          {type: string, required: true}
+      trial_id:           {type: string, required: true, fk: trials.trial_id}
+      site_id:            {type: string, required: true, fk: sites.site_id}
+      target_temp_c:      {type: float}
+      salinity_target_ppt: {type: float}
+      water_source:       {type: enum, values: [sea, fresh, brackish, ras]}
+      oxygenation:        {type: boolean, description: "O2 injection used"}
+      # photoperiod lives in light_regimes (can change during trial)
+
+  # ---------------------------------------------------------------
+  diets:
+    primary_key: diet_id
+    columns:
+      diet_id:          {type: string, required: true}
+      trial_id:         {type: string, required: true, fk: trials.trial_id}
+      label:            {type: string}
+      is_control:       {type: boolean, default: false}
+      dose_value:       {type: float, description: "For dose-response trials (e.g. % lysine)"}
+      dose_unit:        {type: string}
+      marker:           {type: enum, values: [none, Y2O3, other], default: none}
+      # diets = formulation intent. Realised values (pellet size, marker %, dry matter)
+      # live in feed_batches; analysed composition in composition(sample_type = diet).
+      # Tank trials with one production run still create one batch per diet.
+
+  feed_batches:
+    description: >
+      Long cage trials use several production batches per diet; batch
+      composition drifts and must be linked to feeding days.
+    primary_key: batch_id
+    columns:
+      batch_id:         {type: string, required: true}
+      diet_id:          {type: string, required: true, fk: diets.diet_id}
+      production_date:  {type: date}
+      pellet_mm:        {type: float}
+      marker_pct:       {type: float}
+      dm_frac:          {type: float, min: 0, max: 1}
+
+  # ---------------------------------------------------------------
+  units:
+    description: Experimental units – tanks or cages.
+    primary_key: unit_id
+    columns:
+      unit_id:          {type: string, required: true}
+      trial_id:         {type: string, required: true, fk: trials.trial_id}
+      system_id:        {type: string, required: true, fk: systems.system_id}
+      diet_id:          {type: string, required: true, fk: diets.diet_id}
+      unit_type:        {type: enum, values: [tank, cage]}
+      block:            {type: string, description: "Position/row/site block used in randomisation"}
+      diet_code_blind:  {type: string, description: "Code shown to staff when diet_blinding = true"}
+      volume_m3:        {type: float}
+      # stocking date / n / biomass come from the weighings row with sampling_type = stocking
+      smolt_cohort_id:  {type: string, description: "Same cohort across sites avoids cohort x site confounding"}
+      randomisation_seed: {type: integer}
+      # exclusion is NOT stored here (raw data stays untouched): a unit is excluded only if
+      # deviations has a row category = exclusion with decided_by filled in
+
+  # ---------------------------------------------------------------
+  fish:
+    description: Individually tagged fish (optional; PIT-tag trials).
+    primary_key: fish_id
+    columns:
+      fish_id:          {type: string, required: true, description: "PIT tag"}
+      unit_id:          {type: string, required: true, fk: units.unit_id}
+      sex:              {type: enum, values: [female, male, unknown], default: unknown}
+      strain:           {type: string}
+      family_id:        {type: string, description: "For genotype x diet x environment analyses"}
+      # initial weight = first individual weighing of this fish_id
+
+  # ---------------------------------------------------------------
+  weighings:
+    description: >
+      Individual (fish_id filled) or bulk (fish_id empty, n_fish and
+      biomass_kg filled) weighings. Bulk = all fish in unit counted/weighed;
+      sample = subsample used for biomass estimate (sea cages).
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      unit_id:          {type: string, required: true, fk: units.unit_id}
+      date:             {type: date, required: true}
+      sampling_type:    {type: enum, values: [stocking, individual, bulk, sample, harvest], required: true}
+      qc_flag:          {type: enum, values: [raw, ok, suspect, removed], default: raw}
+      fish_id:          {type: string, fk: fish.fish_id}
+      weight_g:         {type: float, min: 0}
+      fork_length_cm:   {type: float, min: 0}
+      n_fish:           {type: integer, min: 0}
+      biomass_kg:       {type: float, min: 0}
+      fasted_hours:     {type: float}
+      capture_method:   {type: enum, values: [crowd_dipnet, trap, all_fish, other],
+                         description: "How the sample was taken – needed to model capture bias"}
+      sample_depth_m:   {type: float}
+    rules:
+      - "individual -> weight_g required"
+      - "stocking, bulk, harvest -> n_fish and biomass_kg required"
+      - "sample -> weight_g required (camera calibration and biomass estimate)"
+      - "every non-excluded unit has exactly one stocking row"
+
+  # ---------------------------------------------------------------
+  feeding:
+    description: Daily feed per unit.
+    primary_key: [unit_id, date, batch_id]   # a batch change mid-day gives two rows
+    columns:
+      unit_id:            {type: string, required: true, fk: units.unit_id}
+      date:               {type: date, required: true}
+      batch_id:           {type: string, required: true, fk: feed_batches.batch_id}
+      feed_given_g:       {type: float, min: 0, required: true}
+      ration_type:        {type: enum, values: [ad_libitum, restricted, fixed_pct_bw]}
+      ration_pct_bw:      {type: float}
+      n_meals:            {type: integer}
+      feeder_type:        {type: enum, values: [automatic, hand, camera_controlled]}
+      # feed dry matter comes from feed_batches.dm_frac via batch_id
+      uneaten_wet_g:      {type: float, min: 0, description: "Tanks only"}
+      uneaten_dm_frac:    {type: float, min: 0, max: 1}
+      feeding_stopped:    {type: boolean, default: false}
+
+  # ---------------------------------------------------------------
+  recovery_tests:
+    description: Uneaten-feed recovery tests in empty units (Helland et al. 1996).
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      unit_type:          {type: enum, values: [tank, cage]}
+      diet_id:            {type: string, fk: diets.diet_id}
+      temp_c:             {type: float}
+      flow_l_min:         {type: float}
+      feed_in_dm_g:       {type: float}
+      feed_recovered_dm_g: {type: float}
+
+  # ---------------------------------------------------------------
+  environment:
+    description: >
+      Continuous sensor data, long format. Either unit_id (tank outlet,
+      cage) or system_id (reference point for a system/site) must be filled.
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      timestamp:          {type: datetime, required: true}
+      unit_id:            {type: string, fk: units.unit_id}
+      system_id:          {type: string, fk: systems.system_id}
+      depth_m:            {type: float}
+      measure_position:   {type: enum, values: [inlet, outlet, in_unit, reference],
+                           description: "Tank O2/CO2 differ between inlet and outlet; report 4.3 recommends outlet"}
+      variable:           {type: enum, values: [temp_c, o2_mg_l, o2_sat_pct, salinity_ppt, ph, co2_mg_l, turbidity_ntu,
+                                                   light_lux, par_umol_m2_s, current_speed_m_s, current_dir_deg,
+                                                   wave_height_m, chlorophyll_ug_l,
+                                                   flow_l_min], required: true}
+      # flow_l_min per tank: O2/CO2 budgets; check exchange is scaled to biomass
+      # (faster-growing diets consume more O2 -> water quality can mediate the diet effect)
+      # o2_sat_pct / o2_mg_l: store what the sensor reports; the other is derived (o2_saturation())
+      value:              {type: float, required: true}
+      sensor_id:          {type: string}
+      qc_flag:            {type: enum, values: [raw, ok, suspect, removed, interpolated], default: raw}
+
+  # ---------------------------------------------------------------
+  water_samples:
+    description: Discrete lab water analyses.
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      date:               {type: date, required: true}
+      unit_id:            {type: string, fk: units.unit_id}
+      system_id:          {type: string, fk: systems.system_id}
+      measure_position:   {type: enum, values: [inlet, outlet, in_unit, reference]}
+      analyte:            {type: enum, values: [tan_mg_l, no2_n_mg_l, no3_n_mg_l, co2_mg_l, ph, alkalinity_mg_l, chloride_mg_l, tss_mg_l]}
+      value:              {type: float, required: true}
+
+  # ---------------------------------------------------------------
+  events:
+    description: Anything that can affect performance independent of diet.
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      unit_id:            {type: string, required: true, fk: units.unit_id}
+      date:               {type: date, required: true}
+      event_type:         {type: enum, values: [mortality, removal_sampling, lice_treatment, handling, grading, vaccination, equipment_failure, low_oxygen_alarm, disease_diagnosis, escape, oxygen_dosing, temperature_excursion, feeding_stop, other], required: true}
+      n_fish:             {type: integer, min: 0}
+      biomass_kg:         {type: float}
+      cause:              {type: string, description: "e.g. wound, CMS, treatment-related, unknown"}
+      treatment_method:   {type: string, description: "e.g. thermal, mechanical, freshwater, medicinal"}
+      notes:              {type: string}
+
+  # ---------------------------------------------------------------
+  composition:
+    description: Chemical analyses of diets, whole body, fillet, liver, feces.
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      sample_id:          {type: string, required: true}
+      unit_id:            {type: string, fk: units.unit_id}
+      diet_id:            {type: string, fk: diets.diet_id}
+      batch_id:           {type: string, fk: feed_batches.batch_id}
+      date:               {type: date}
+      sample_type:        {type: enum, values: [diet, whole_body_initial, whole_body_final, fillet, liver, feces], required: true}
+      feces_method:       {type: enum, values: [stripping, dissection, settling, none], default: none}
+      n_fish_pooled:      {type: integer}
+      analyte:            {type: string, required: true, description: "Open list (dm, protein, lipid, energy, ash, Y, astaxanthin, EPA, DHA, ...); water_samples.analyte is a closed enum on purpose"}
+      value:              {type: float, required: true}
+      value_unit:         {type: string, required: true, description: "g/kg, MJ/kg, mg/kg, % of FA"}
+
+  # ---------------------------------------------------------------
+  fish_measurements:
+    description: Terminal per-fish measurements (organ indices, quality).
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      unit_id:            {type: string, required: true, fk: units.unit_id}
+      fish_id:            {type: string, fk: fish.fish_id}
+      date:               {type: date, required: true}
+      body_weight_g:      {type: float}
+      liver_g:            {type: float}
+      viscera_g:          {type: float}
+      gutted_g:           {type: float}
+      fillet_fat_pct:     {type: float}
+      salmofan:           {type: float}
+      astaxanthin_mg_kg:  {type: float}
+      firmness_newton:    {type: float, description: "Instrumental fillet firmness (N)"}
+      gaping_score:       {type: integer}
+      cataract_score:     {type: integer}
+      gill_score:         {type: integer}
+      fin_damage_score:   {type: integer}
+      wound_score:        {type: integer}
+      maturation:         {type: boolean}
+
+  # ---------------------------------------------------------------
+  camera_estimates:
+    description: >
+      Aggregated output from biomass cameras (one row per unit x camera x
+      period, usually daily). Thousands of detections are NOT independent
+      replicates – the cage remains the experimental unit.
+    primary_key: [unit_id, camera_id, period_start]
+    columns:
+      unit_id:            {type: string, required: true, fk: units.unit_id}
+      camera_id:          {type: string, required: true}
+      period_start:       {type: datetime, required: true}
+      period_end:         {type: datetime, required: true}
+      camera_depth_m:     {type: float}
+      hours_active:       {type: float}
+      n_detections:       {type: integer, min: 0, description: "Valid fish measured in period"}
+      mean_weight_g:      {type: float}
+      sd_weight_g:        {type: float}
+      median_weight_g:    {type: float}
+      p10_weight_g:       {type: float}
+      p90_weight_g:       {type: float}
+      mean_length_cm:     {type: float}
+      condition_k:        {type: float}
+      algorithm_version:  {type: string, required: true,
+                           description: "Vendor model version – version changes create step changes in the series"}
+      calibration_id:     {type: string, fk: camera_calibrations.calibration_id, description: "Link to calibration against manual samples"}
+
+  camera_distributions:
+    description: Optional daily weight histograms from cameras.
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      unit_id:            {type: string, required: true, fk: units.unit_id}
+      camera_id:          {type: string, required: true}
+      date:               {type: date, required: true}
+      bin_lower_g:        {type: float, required: true}
+      bin_upper_g:        {type: float, required: true}
+      n_fish:             {type: integer, min: 0}
+
+  # ---------------------------------------------------------------
+  light_regimes:
+    description: >
+      Artificial light schedule per unit/system. Natural daylength is
+      derived from site latitude and date, not stored here.
+    primary_key: regime_id
+    columns:
+      regime_id:          {type: string, required: true}
+      unit_id:            {type: string, fk: units.unit_id}
+      system_id:          {type: string, fk: systems.system_id}
+      start_date:         {type: date, required: true}
+      end_date:           {type: date}
+      light_source:       {type: enum, values: [natural_only, led_white, led_blue, led_green, metal_halide, other]}
+      n_lamps:            {type: integer}
+      lamp_depth_m:       {type: float}
+      power_w_per_lamp:   {type: float}
+      schedule:           {type: string, description: "e.g. '24L', '06:00-22:00', 'natural+24L'"}
+      intensity_target:   {type: float}
+      intensity_unit:     {type: string, description: "lux or umol/m2/s"}
+
+  # ---------------------------------------------------------------
+  lice_counts:
+    description: Sea lice counts (sea cages).
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      unit_id:            {type: string, required: true, fk: units.unit_id}
+      date:               {type: date, required: true}
+      n_fish_sampled:     {type: integer, required: true}
+      adult_female:       {type: integer}
+      mobile:             {type: integer}
+      attached:           {type: integer}
+      method:             {type: enum, values: [manual, camera]}
+
+  # ---------------------------------------------------------------
+  camera_calibrations:
+    description: Camera vs manual-sample calibration per unit/camera/algorithm version.
+    primary_key: calibration_id
+    columns:
+      calibration_id:     {type: string, required: true}
+      unit_id:            {type: string, required: true, fk: units.unit_id}
+      camera_id:          {type: string, required: true}
+      algorithm_version:  {type: string, required: true}
+      light_regime_id:    {type: string, fk: light_regimes.regime_id,
+                           description: "Lights change fish depth distribution -> recalibrate"}
+      date:               {type: date, required: true}
+      n_manual:           {type: integer}
+      n_camera:           {type: integer}
+      bias_g:             {type: float, description: "camera - manual mean"}
+      loa_lower_g:        {type: float, description: "Bland-Altman limits of agreement"}
+      loa_upper_g:        {type: float}
+      slope:              {type: float}
+      intercept_g:        {type: float}
+
+  # ---------------------------------------------------------------
+  deviations:
+    description: Protocol deviations and analysis-plan deviations (agent + human log).
+    primary_key: record_id
+    columns:
+      record_id:          {type: string, required: true, description: "Surrogate key (source system row id or uuid)"}
+      trial_id:           {type: string, required: true, fk: trials.trial_id}
+      date:               {type: date, required: true}
+      unit_id:            {type: string, fk: units.unit_id}
+      category:           {type: enum, values: [protocol, data_quality, analysis_plan, exclusion]}
+      description:        {type: string, required: true}
+      raised_by:          {type: enum, values: [agent, human]}
+      decision:           {type: string}
+      decided_by:         {type: string}
+      decided_date:       {type: date}
+
+# =====================================================================
+# Cross-table rules consumed by validate_trial_data()
+# =====================================================================
+cross_table_rules:
+  - {id: R01, severity: error,   rule: "every units.system_id, diet_id exists; every unit has a stocking weighing"}
+  - {id: R02, severity: error,   rule: "design check: if a factor (e.g. temperature) varies only between systems, replicate systems per level >= 2, else flag no replication for that factor"}
+  - {id: R03, severity: error,   rule: "a unit or record is treated as excluded only if deviations has a row (category = exclusion, decided_by not null) naming its unit_id or record_id"}
+  - {id: R04, severity: error,   rule: "fish count balance per unit: stocked - mortality - removal_sampling - escape = n_fish at harvest (tolerance in plan)"}
+  - {id: R05, severity: error,   rule: "weight_g and biomass_kg/n_fish consistent: mean weight within plausible range of previous sampling (no negative growth > tolerance)"}
+  - {id: R06, severity: warning, rule: "initial weight CV and mean balanced across diets (check_baseline_balance)"}
+  - {id: R07, severity: warning, rule: "feeding rows have no gaps within trial period unless feeding_stopped or a feeding_stop event exists"}
+  - {id: R08, severity: warning, rule: "uneaten feed recorded for every tank-feeding day; a recovery_tests row exists for each unit_type x diet x temperature"}
+  - {id: R09, severity: warning, rule: "environment series: gaps > 6 h, flat-lined sensors, o2_sat_pct > 150 or < 0, temp jumps > 3 C per hour -> qc_flag suspect"}
+  - {id: R10, severity: warning, rule: "camera_estimates: algorithm_version changes mid-trial without a new camera_calibrations row; n_detections below plan minimum"}
+  - {id: R11, severity: warning, rule: "light_regimes cover the whole trial period for every unit/system (gaps or overlaps)"}
+  - {id: R13, severity: error,   rule: "environment, water_samples, light_regimes: exactly one of unit_id / system_id is filled"}
+  - {id: R14, severity: error,   rule: "fish_measurements rows (terminal sampling) have a matching events row removal_sampling on the same unit and date with n_fish >= rows"}
+  - {id: R15, severity: error,   rule: "qc_flag = removed on any record requires a deviations row naming that record_id"}
+  - {id: R12, severity: info,    rule: "diet_blinding = true but diets.label visible in unit-level exports"}
