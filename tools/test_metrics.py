@@ -262,6 +262,42 @@ def test_rich_hand_computed():
           rk, ["unit_day_risk"])
 
 
+def test_bulk_lots_with_mean_weight():
+    """Count lots that report n and MEAN weight only (no biomass_kg): B_lot = n * weight_g / 1000."""
+    con, ins = tiny()
+    ins("unit_occasions", unit_id="U", occasion="mid1", seq=2, occasion_date=day(10))
+    ins("weighings", record_id="L1", unit_id="U", occasion="mid1", date=day(10), lot_no=1, sampling_type="bulk",
+        n_fish=60, weight_g=150.0)
+    ins("weighings", record_id="L2", unit_id="U", occasion="mid1", date=day(10), lot_no=2, sampling_type="bulk",
+        n_fish=40, weight_g=200.0, biomass_kg=8.0)
+    n, b = M.count_at(con, "U", "mid1")
+    check("count lots: n", n == 100, n, ["count_rows"])
+    check("count lots: B from mean weight + biomass", close(b, 60 * 150 / 1000 + 8.0), b, ["count_rows", "biomass_kg"])
+    w = F["unit_weight_g"](con, "U", "mid1")
+    check("count lots: W = 1000 B / n", close(w, 1000 * 17.0 / 100), w, ["unit_weight_g"])
+
+
+def test_adc_wet_basis_feces():
+    """Feces reported on a WET basis with a dm analyte must give the same ADC as on DM basis."""
+    con, model, truth = make_trial(YAML)
+    M.use_model(con, model)
+    uid = "U1D1"
+    dm_ref = F["adc_pct"](con, uid, "protein")
+    dmadc_ref = F["adc_pct"](con, uid, "dm")     # dry-matter ADC depends on the marker alone
+    con.execute("UPDATE composition SET value = value * 0.25, basis = 'wet' WHERE unit_id = ? AND sample_type = 'feces'",
+                (uid,))
+    con.execute("INSERT INTO composition (record_id, trial_id, sample_id, unit_id, sample_type, feces_method, "
+                "collection_start, collection_end, analyte, value, value_unit, basis) SELECT 'CF_DM', trial_id, "
+                "sample_id, unit_id, sample_type, feces_method, collection_start, collection_end, 'dm', 250, 'g_kg', "
+                "'wet' FROM composition WHERE record_id = 'CF_U1D1_Y'")
+    wet = F["adc_pct"](con, uid, "protein")
+    check("adc on wet-basis feces equals DM-basis ADC", close(wet, dm_ref, 1e-6), (wet, dm_ref), ["adc_pct"])
+    check("adc on wet-basis feces equals truth", close(wet, truth[uid]["adc_protein_pct"], 0.1), wet, ["adc_pct"])
+    dmadc = F["adc_pct"](con, uid, "dm")
+    check("dry-matter ADC on wet-basis feces unchanged (75 %)", close(dmadc, dmadc_ref, 1e-6) and close(dmadc, 75.0, 0.05),
+          (dmadc, dmadc_ref), ["adc_pct"])
+
+
 def test_dose_realised():
     con, ins = tiny()
     ins("feed_batches", batch_id="B2", diet_id="D", pellet_mm=3.0, dm_frac=0.8)
@@ -504,7 +540,8 @@ def test_nh3():
 if __name__ == "__main__":
     for fn in (test_registry, test_synthetic, test_rich_hand_computed, test_dose_realised, test_fish_level_indices,
                test_weight_basis, test_period_sum_coverage, test_relative_to_weighing, test_recount_reset,
-               test_transfer_in_and_estimates, test_kaplan_meier, test_n_fish_d0_from_stocking, test_daylength, test_nh3):
+               test_transfer_in_and_estimates, test_kaplan_meier, test_n_fish_d0_from_stocking, test_daylength, test_nh3,
+               test_bulk_lots_with_mean_weight, test_adc_wet_basis_feces):
         try:
             fn()
         except Exception as e:     # a crash is a failure, keep running the others

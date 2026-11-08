@@ -153,6 +153,8 @@ MUTATIONS = [
                          " dose_unit = 'g_kg', dose_basis = 'added', dose_analyte = 'protein'")),
     ("R22", None, "camera estimate outside its calibration window",
      lambda c: (calib(c, "CAL1", "U1D1", 0, 20), camera(c, "U1D1", 59, cal="CAL1"))),
+    ("R23", None, "D1_B1 dm_frac 0.917 vs analysed 0.920: just outside the 0.002 tolerance",
+     lambda c: c.execute("UPDATE feed_batches SET dm_frac = 0.917 WHERE batch_id = 'D1_B1'")),
     ("R23", None, "D1_B1 dm_frac 0.85 vs analysed 0.92",
      lambda c: c.execute("UPDATE feed_batches SET dm_frac = 0.85 WHERE batch_id = 'D1_B1'")),
     ("R24", None, "sea_cage trial (SY1 system_kind NULL), temperatures without depth",
@@ -208,6 +210,8 @@ MUTATIONS = [
 
 
 NEGATIVE = [
+    ("R23", "D1_B1 dm_frac 0.9185 vs analysed 0.920: inside the 0.002 tolerance",
+     lambda c: c.execute("UPDATE feed_batches SET dm_frac = 0.9185 WHERE batch_id = 'D1_B1'")),
     ("R21", "dose_basis added with D1 as basal diet (dose 0) and D2 dosed",
      lambda c: c.execute("UPDATE diets SET dose_value = CASE diet_id WHEN 'D1' THEN 0 ELSE 2.0 END,"
                          " dose_unit = 'g_kg', dose_basis = 'added', dose_analyte = 'protein'")),
