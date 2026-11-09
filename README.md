@@ -14,8 +14,8 @@ Requirements: Python 3.12 and `pyyaml`; SQLite is built in. No R, no database se
 
 ```bash
 pip install pyyaml
-python3 tools/run_all_tests.py data_model.yaml        # the whole proof chain, about 3.5 min
-python3 tools/validate.py data_model.yaml trial.db    # rule findings by severity; exit 1 on error
+python3 tools/run_all_tests.py data_model.yaml        # full proof chain, about 3.5 min
+python3 tools/validate.py data_model.yaml trial.db    # rule findings; exit code 1 on error
 python3 tools/metrics.py  data_model.yaml trial.db    # one analysis row per tank or cage
 ```
 
