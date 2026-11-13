@@ -6,6 +6,18 @@ alongside them, what is needed to know which conclusions the data can support. I
 tools that build it into a database, compute the metrics, check the rules, run the planned
 statistics, show the result as a dashboard and test all of it.
 
+## Dashboard
+
+[![Dashboard overview of the sample trial: design, rule findings, proof chain, the primary outcome and all pre-registered outcomes](assets/dashboard_overview.png)](https://okan-wqm.github.io/su-is/dashboard.html)
+
+**[Open the full dashboard](https://okan-wqm.github.io/su-is/dashboard.html)**: design and plan, data quality,
+growth, feed, survival and environment, every statistical test with an explanation, power, and
+the evidence from the proof chain, on one page. It is [`dashboard.html`](dashboard.html) in this
+repository, a single self-contained file that also opens offline in any browser. It shows the
+synthetic sample trial (`tools/synthetic_trial.py`), not a real experiment, and was built from
+the commit named on the page; after a change, run the proof chain and rebuild it with
+`python3 tools/build_dashboard.py data_model.yaml --out dashboard.html`.
+
 The model is a starting point. Column vocabularies and importers have to be fitted to an
 organisation's own systems before it is used on real data (see [Adapting it](#adapting-it)).
 
