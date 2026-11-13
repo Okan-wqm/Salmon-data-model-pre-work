@@ -8,9 +8,9 @@ statistics, show the result as a dashboard and test all of it.
 
 ## Dashboard
 
-[![Dashboard overview of the sample trial: design, rule findings, proof chain, the primary outcome and all pre-registered outcomes](assets/dashboard_overview.png)](https://htmlpreview.github.io/?https://github.com/Okan-wqm/su-is/blob/main/dashboard.html)
+[![Dashboard overview of the sample trial: design, rule findings, proof chain, the primary outcome and all pre-registered outcomes](assets/dashboard_overview.png)](https://htmlpreview.github.io/?https://github.com/Okan-wqm/Salmon-data-model-pre-work/blob/main/dashboard.html)
 
-**[Open the full dashboard](https://htmlpreview.github.io/?https://github.com/Okan-wqm/su-is/blob/main/dashboard.html)**: design and plan, data quality,
+**[Open the full dashboard](https://htmlpreview.github.io/?https://github.com/Okan-wqm/Salmon-data-model-pre-work/blob/main/dashboard.html)**: design and plan, data quality,
 growth, feed, survival and environment, every statistical test with an explanation, power, and
 the evidence from the proof chain, on one page. It is [`dashboard.html`](dashboard.html) in this
 repository, a single self-contained file: the link shows it through htmlpreview.github.io, and a
