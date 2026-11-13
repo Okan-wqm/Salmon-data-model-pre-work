@@ -1,0 +1,4 @@
+# tools/analysis.py and tools/test_analysis.py (step 8 of the proof chain); the other tools need pyyaml only.
+# Tested with numpy 2.4.6 and scipy 1.17.1 on Python 3.11.
+numpy>=2.0
+scipy>=1.13

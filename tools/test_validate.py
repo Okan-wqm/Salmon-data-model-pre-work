@@ -260,9 +260,8 @@ MUTATIONS = [
     ("R29", None, "diet D1 marker none while feces exist",
      lambda c: c.execute("UPDATE diets SET marker = 'none' WHERE diet_id = 'D1'")),
     ("R30", None, "two feces methods, ADC outcome declares single_method",
-     lambda c: (c.execute("UPDATE composition SET feces_method = 'dissection' WHERE sample_id = 'FEC_U1D1'"),
-                plan(c, "lm(adc ~ diet)", outcome="adc_pct", label="adc_protein", analyte="protein",
-                     adc_method_handling="single_method"))),
+     # the trial's own plan (P1) declares outcome adc_protein with adc_method_handling single_method
+     lambda c: c.execute("UPDATE composition SET feces_method = 'dissection' WHERE sample_id = 'FEC_U1D1'")),
     ("R30", "warning", "feces rows without feces_method (excluded from ADC)",
      lambda c: c.execute("UPDATE composition SET feces_method = NULL WHERE sample_id = 'FEC_U1D1'")),
     ("R31", None, "U1D1 / U1D2 become cages 10 m apart with different diets",
@@ -428,6 +427,21 @@ def main():
             fails.append("a rule crashed without the metrics module")
     finally:
         V.M = saved
+
+    # 5. the analysis plan: the synthetic trial records one, so the plan-dependent rules are checked
+    # on it; on a trial without plan rows they must be reported as not checked, never as passed
+    plan_rules = ("R28", "R30", "R35", "R38")
+    for rid in plan_rules:
+        if any(f["rule"] == rid for f in clean):
+            fails.append("%s: finding on the clean trial although its plan is recorded" % rid)
+    c = copy(con)
+    for t in ("analysis_runs", "covariate_roles", "planned_outcomes", "analysis_plans"):
+        c.execute('DELETE FROM "%s"' % t)
+    fs = V.validate(c, model, TRIAL)
+    for rid in plan_rules:
+        if not any(f["rule"] == rid and f["severity"] == "info" and "not checked" in f["message"] for f in fs):
+            fails.append("%s: no 'not checked' info on a trial without plan rows" % rid)
+    print("ok   plan rules %s: silent on the recorded plan, 'not checked' without plan rows" % ", ".join(plan_rules))
 
     with open(os.path.join(HERE, ".coverage_rules.json"), "w") as f:
         json.dump({"exercised": sorted(exercised), "waived": waived}, f, indent=1)

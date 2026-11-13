@@ -8,18 +8,24 @@
   5 metrics     tools/test_metrics.py      every derived metric matches the known truth
   6 rules       tools/test_validate.py     clean trial has no errors; every validator rule fires on its mutation
   7 thresholds  tools/test_calibrate.py    thresholds estimated from historical data recover known values
-  8 boundaries  tools/test_thresholds.py   every validation_params_defaults value shifted x10 and x0.1 is
+  8 analysis    tools/test_analysis.py     every statistical analysis recovers the known effects, agrees with
+                                           an independent implementation and keeps its error rate with no effect
+  9 boundaries  tools/test_thresholds.py   every validation_params_defaults value shifted x10 and x0.1 is
                                            caught by a test (each threshold tested at its boundary)
-  9 coverage    (this file)                every derived metric, every validator rule and every constraint
+ 10 coverage    (this file)                every derived metric, validator rule, constraint and analysis
                                            is exercised by a test -- no untested element
+
+Steps 1-7 and 9 need only pyyaml; step 8 needs numpy and scipy as well (requirements-analysis.txt).
 
 Each step needs the previous ones: a metric test on a schema that does not build proves nothing.
 Usage: python3 tools/run_all_tests.py [data_model.yaml]
 """
 import json
 import os
+import platform
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 YAML = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(HERE), "data_model.yaml")
@@ -32,6 +38,7 @@ STEPS = [
     ("metrics", ["test_metrics.py", YAML]),
     ("rules", ["test_validate.py", YAML]),
     ("thresholds", ["test_calibrate.py", YAML]),
+    ("analysis", ["test_analysis.py", YAML]),
     ("boundaries", ["test_thresholds.py", YAML]),
 ]
 
@@ -42,7 +49,7 @@ def run(script, *args):
 
 
 def coverage():
-    """Every derived metric / validator rule / constraint must be exercised by a test.
+    """Every derived metric / validator rule / constraint / analysis must be exercised by a test.
     The test scripts write what they exercised to coverage_*.json (see each test)."""
     sys.path.insert(0, HERE)
     from build_db import all_constraints, load_model
@@ -53,6 +60,11 @@ def coverage():
         "rules": {r["id"] for r in model["cross_table_rules"] if "validator" in r["enforced_by"]},
         "constraints": {c["id"] for c in all_constraints(model)},
     }
+    try:
+        from analysis import ANALYSES
+        need["analyses"] = set(ANALYSES)
+    except ImportError as e:                    # numpy / scipy missing: reported, never skipped silently
+        problems.append("analyses: tools/analysis.py cannot be imported (%s)" % e)
     for kind, want in need.items():
         path = os.path.join(HERE, ".coverage_%s.json" % kind)
         if not os.path.exists(path):
@@ -70,27 +82,40 @@ def coverage():
     return problems
 
 
+def record(steps):
+    """Result of this run for tools/build_dashboard.py (removed at the start of the next run)."""
+    with open(os.path.join(HERE, ".coverage_chain.json"), "w") as f:
+        json.dump({"python": platform.python_version(), "platform": platform.system(), "steps": steps}, f, indent=1)
+
+
 def main():
     # coverage records must come from THIS run, never from an earlier one
     for f in os.listdir(HERE):
         if f.startswith(".coverage_") and f.endswith(".json"):
             os.remove(os.path.join(HERE, f))
+    steps = []
     for name, (script, *args) in STEPS:
         if not os.path.exists(os.path.join(HERE, script)):
             print("FAIL %-11s missing %s" % (name, script))
             sys.exit(1)
+        t0 = time.time()
         code, out = run(script, *args)
         last = out.splitlines()[-1] if out else ""
-        print("%s %-11s %s" % ("ok  " if code == 0 else "FAIL", name, last[:150]))
+        print("%s %-11s %s" % ("ok  " if code == 0 else "FAIL", name, last[:150]), flush=True)
+        steps.append({"step": name, "script": script, "ok": code == 0, "message": last, "seconds": round(time.time() - t0, 1)})
         if code:
             print(out[-3000:])
+            record(steps)
             sys.exit(1)
     problems = coverage()
+    steps.append({"step": "coverage", "script": "run_all_tests.py", "ok": not problems, "seconds": 0.0,
+                  "message": "; ".join(problems) or "every metric, validator rule, constraint and analysis is exercised by a test"})
+    record(steps)
     if problems:
         for p in problems:
             print("FAIL coverage   " + p)
         sys.exit(1)
-    print("ok   coverage    every metric, validator rule and constraint is exercised by a test")
+    print("ok   coverage    every metric, validator rule, constraint and analysis is exercised by a test")
 
 
 if __name__ == "__main__":

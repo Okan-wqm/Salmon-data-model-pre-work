@@ -138,7 +138,9 @@ def main():
             shifts = [("->5", 5)] if v == 0 else [(lab, shifted(name, v, f)) for lab, f in FACTORS]
             for lab, nv in shifts:
                 n_shift += 1
-                root = os.path.join(tmp, "%s_%s" % (name, lab))
+                # the label can hold characters that are not valid in a directory name on
+                # Windows ('->5' for parameters whose default is 0), so it is not used verbatim
+                root = os.path.join(tmp, "%s_%s" % (name, re.sub(r"[^A-Za-z0-9_.]", "_", lab)))
                 caught = run_tests(root, write_copy(text, name, nv, root))
                 shutil.rmtree(root, ignore_errors=True)
                 if caught:

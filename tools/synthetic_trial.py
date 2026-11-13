@@ -8,6 +8,10 @@ Daily feeding with a batch change (3 mm -> 4 mm) at mid1, uneaten-feed collectio
 few missed days, unit temperature sensors with gaps (system reference as fallback),
 weighed daily mortality, a terminal sampling of 5 fish at mid1, harvest at final, diet /
 feces / whole-body composition with a Y2O3 marker, one pending and one decided deviation.
+The trial also carries its pre-registered analysis plan (PLAN_OUTCOMES: one primary and four
+secondary outcomes plus an exploratory one, each with model, error strata, scale and
+multiplicity handling), covariate roles, the two randomisation runs, blind diet codes and a
+locked primary analysis run, so rules R28, R30, R35 and R38 are checked on it.
 
 The generator returns the connection and a `truth` dict per unit (true counts, biomass,
 feed eaten on a dry-matter basis, gain incl. removed fish, protein deposited, ADC), so that
@@ -16,6 +20,7 @@ tools/metrics.py can be checked against values that do not depend on the metric 
 Usage: synthetic_trial.py [data_model.yaml] [out.db]
 """
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -38,6 +43,44 @@ WASTE_FRAC = 0.06                       # true uneaten share of DM given
 RECOVERY = {3.0: 0.86, 4.0: 0.82}       # true recovery of uneaten DM by pellet size
 UNEATEN_DM = 0.35
 PROT_BODY = (165.0, 175.0)              # g/kg wet, initial and final whole body
+SGR_NOISE = 0.03                        # a tank grows at its cell SGR x uniform(1 - SGR_NOISE, 1 + SGR_NOISE)
+FISH_CV = 0.04                          # SD of an individual weight relative to the tank mean
+DAILY_DEATH_PROB = 0.04                 # chance of one death per tank and day, the same for every diet and temperature
+BLIND_CODE = {"D1": "F17", "D2": "F42"}   # units.diet_code_blind: what feeders and assessors see
+
+# Pre-registered analysis plan (analysis_plans P1, frozen before d0). tools/analysis.py reads these
+# rows and runs exactly the models named here; tools/test_analysis.py checks the power inputs.
+# The tank is the unit; temperature is applied to systems, so every model has system as an error
+# stratum (R35). expected_sd = SD between tanks of the same diet in the same system; with 2 systems
+# per temperature the diet contrast has 2 error df and mdd is the difference found with 80 % power.
+_STRATA = "system, system:unit"
+_COMMON = {"occasion": "final", "estimand": "total", "error_strata": _STRATA, "unit_of_analysis": "unit",
+           "missing_data_handling": "complete_case", "two_sided": 1, "alpha": 0.05,
+           "contrast": "D2 vs D1 (reference), averaged over temperature",
+           "planned_n_units_per_level": 4, "planned_n_fish_per_unit": 100}
+PLAN_OUTCOMES = [
+    {"outcome_label": "growth_sgr", "outcome": "sgr_pct_day", "role": "primary", "family": "primary",
+     "hierarchy_rank": 1, "multiplicity_method": "none", "scale": "raw",
+     "model": "aov(sgr_pct_day ~ diet*temperature + Error(system))",
+     "expected_sd": 0.025, "sd_level": "unit", "mdd": 0.10, "power": 0.80, "n_occasions": 3,
+     "dropout_assumed_pct": 0.0},
+    {"outcome_label": "intake_log", "outcome": "intake_dm_g", "role": "secondary", "family": "secondary",
+     "multiplicity_method": "holm", "scale": "log", "log_definition": "log_of_unit_mean",
+     "model": "aov(log(intake_dm_g) ~ diet*temperature + Error(system))"},
+    {"outcome_label": "gain_log", "outcome": "biomass_gain_kg", "role": "secondary", "family": "secondary",
+     "multiplicity_method": "holm", "scale": "log", "log_definition": "log_of_unit_mean",
+     "model": "aov(log(biomass_gain_kg) ~ diet*temperature + Error(system))"},
+    {"outcome_label": "feed_per_gain_log", "outcome": "fcr_biological", "role": "secondary", "family": "secondary",
+     "multiplicity_method": "holm", "scale": "log", "log_definition": "log_of_unit_mean",
+     "model": "aov(log(intake_dm_g) - log(biomass_gain_kg) ~ diet*temperature + Error(system))"},
+    {"outcome_label": "survival_logit", "outcome": "survival_pct", "role": "secondary", "family": "secondary",
+     "multiplicity_method": "holm", "scale": "logit",
+     "model": "aov(empirical_logit(survival_pct) ~ diet*temperature + Error(system))"},
+    {"outcome_label": "adc_protein", "outcome": "adc_pct", "analyte": "protein", "role": "exploratory",
+     "family": "exploratory", "multiplicity_method": "none", "scale": "raw", "adc_method_handling": "single_method",
+     "model": "aov(adc_pct ~ diet*temperature + Error(system))"},
+]
+PLAN_TEXT = json.dumps([dict(_COMMON, **o) for o in PLAN_OUTCOMES], sort_keys=True)
 
 
 def day(d):
@@ -65,6 +108,9 @@ def make_trial(yaml_path="data_model.yaml", db=":memory:", seed=7):
     ins("sensors", sensor_id="SCALE1", variable="weight")
     ins("design_factors", factor_id="F_TEMP", trial_id="T1", name="temperature", role="assigned_treatment",
         applied_at="system", level_type="numeric")
+    # the two tanks of a system (one per diet) form a block: units.block = system_id (R20)
+    ins("design_factors", factor_id="F_BLOCK", trial_id="T1", name="block", role="blocking",
+        applied_at="system", level_type="categorical")
     for sid, temp in SYSTEMS.items():
         ins("sensors", sensor_id="REF_" + sid, variable="temp_c")
         ins("systems", system_id=sid, trial_id="T1", site_id="S1", system_kind="ras", temp_control="controlled",
@@ -72,6 +118,8 @@ def make_trial(yaml_path="data_model.yaml", db=":memory:", seed=7):
             start_date=day(0), acclimation_start=day(-7) if sid in ACCLIM else day(0))
         ins("factor_levels", record_id="FL_" + sid, factor_id="F_TEMP", system_id=sid, level="%dC" % temp,
             numeric_value=temp, level_order=1 if temp == 12 else 2, is_reference=1 if temp == 12 else 0)
+        ins("factor_levels", record_id="FB_" + sid, factor_id="F_BLOCK", system_id=sid, level=sid,
+            level_order=int(sid[2:]))
         ins("light_regimes", regime_id="LR_" + sid, system_id=sid, start_date=day(-7), light_source="led_white",
             schedule="24L", light_hours_per_day=24)
     batches = {}
@@ -102,9 +150,9 @@ def make_trial(yaml_path="data_model.yaml", db=":memory:", seed=7):
             units.append(("U%d%s" % (i + 1, did), sid, did))
     for uid, sid, did in units:
         temp = SYSTEMS[sid]
-        sgr = DIETS[did]["sgr"][temp] / 100.0 * rng.uniform(0.97, 1.03)
+        sgr = DIETS[did]["sgr"][temp] / 100.0 * rng.uniform(1 - SGR_NOISE, 1 + SGR_NOISE)
         ins("units", unit_id=uid, trial_id="T1", system_id=sid, diet_id=did, cohort_id="C1", unit_type="tank",
-            volume_m3=1.0, block=sid, block_scope="within_system")
+            volume_m3=1.0, block=sid, block_scope="within_system", diet_code_blind=BLIND_CODE[did])
         stock_day = -7 if sid in ACCLIM else 0
         occ = ([("stocking", 0, stock_day)] if stock_day < 0 else []) + [("d0", 1, 0), ("mid1", 2, MID), ("final", 3, FINAL)]
         for name, seq, d in occ:
@@ -122,7 +170,7 @@ def make_trial(yaml_path="data_model.yaml", db=":memory:", seed=7):
             nonlocal rid
             rid += 1
             ins("events", record_id="%s_EV%03d" % (uid, rid), unit_id=uid, date=day(d), event_type=etype,
-                n_fish=nf, outcome_class=oc if nf else None, biomass_kg=biomass,
+                n_fish=nf, n_fish_estimated=0 if nf else None, outcome_class=oc if nf else None, biomass_kg=biomass,
                 weight_source=ws if ws else ("not_applicable" if nf == 0 else "weighed"),
                 relative_to_weighing=rel, cause_category="unknown" if etype == "mortality" and nf else None)
 
@@ -138,7 +186,7 @@ def make_trial(yaml_path="data_model.yaml", db=":memory:", seed=7):
                 for k in range(20):
                     ins("weighings", record_id="%s_%s_S%02d" % (uid, occn, k + 1), unit_id=uid, occasion=occn,
                         date=day(d), sampling_type="sample", specimen_no=k + 1,
-                        weight_g=round(mean_w(d) * rng.gauss(1, 0.04), 1), weight_basis="round",
+                        weight_g=round(mean_w(d) * rng.gauss(1, FISH_CV), 1), weight_basis="round",
                         fish_fate="killed" if (d == MID and k < 5) else "returned", instrument_id="SCALE1")
             if d == MID:   # terminal sampling of 5 fish after the weighing
                 b = round(5 * mean_w(d) / 1000, 4)
@@ -151,7 +199,7 @@ def make_trial(yaml_path="data_model.yaml", db=":memory:", seed=7):
                         date=day(d), kill_method="percussion", body_weight_g=round(w, 1),
                         liver_g=round(w * 0.012, 2), viscera_g=round(w * 0.09, 2), viscera_includes_liver=1)
             # mortality (weighed; daily row, zero allowed)
-            dead = 1 if rng.random() < 0.04 else 0
+            dead = 1 if rng.random() < DAILY_DEATH_PROB else 0
             if d >= 0:
                 if dead:
                     b = round(dead * mean_w(d) * 0.8 / 1000, 4)
@@ -190,7 +238,7 @@ def make_trial(yaml_path="data_model.yaml", db=":memory:", seed=7):
             sampling_type="harvest", n_fish=n, biomass_kg=b_end, weight_basis="round", instrument_id="SCALE1")
         for k in range(20):
             ins("weighings", record_id="%s_final_S%02d" % (uid, k + 1), unit_id=uid, occasion="final", date=day(FINAL),
-                sampling_type="sample", specimen_no=k + 1, weight_g=round(mean_w(FINAL) * rng.gauss(1, 0.04), 1),
+                sampling_type="sample", specimen_no=k + 1, weight_g=round(mean_w(FINAL) * rng.gauss(1, FISH_CV), 1),
                 weight_basis="round", fish_fate="returned", instrument_id="SCALE1")
         ev(FINAL, "harvest", n, "harvest", b_end)
         ins("composition", record_id="CW_" + uid, trial_id="T1", sample_id="WB_" + uid, unit_id=uid,
@@ -240,6 +288,23 @@ def make_trial(yaml_path="data_model.yaml", db=":memory:", seed=7):
     ins("deviations", record_id="DEV2", trial_id="T1", date=day(MID), category="data_quality", target_table="weighings",
         target_record_id="U1D1_mid1_S20", description="Scale error", decided_by="trial manager", decided_date=day(MID),
         raised_by="human")
+    # analysis plan, frozen a week before d0; no random numbers are drawn here, so the data above
+    # are the same with or without these rows
+    ins("analysis_plans", plan_id="P1", trial_id="T1", version="1", file_path="tools/synthetic_trial.py#PLAN_TEXT",
+        file_hash=hashlib.sha256(PLAN_TEXT.encode()).hexdigest(), frozen_at="2025-02-24T12:00:00Z")
+    for o in PLAN_OUTCOMES:
+        ins("planned_outcomes", plan_id="P1", **dict(_COMMON, **o))
+    ins("covariate_roles", plan_id="P1", variable="w_d0", role="precision", measured="baseline")
+    ins("covariate_roles", plan_id="P1", variable="density_kg_m3", role="mediator", measured="post_random")
+    ins("randomisations", randomisation_id="RND_TEMP", trial_id="T1", scope="factor_to_system", method="complete",
+        seed=20250210, software="python random (stdlib)", allocation_concealed=1, performed_by="trial statistician",
+        date=day(-21))
+    ins("randomisations", randomisation_id="RND_DIET", trial_id="T1", scope="diet_to_unit", method="blocked",
+        strata="system", seed=20250211, software="python random (stdlib)", allocation_concealed=1,
+        performed_by="trial statistician", date=day(-21))
+    # primary analysis locked after the last weighing (d84 = 2025-05-26) and before unblinding (R38)
+    ins("analysis_runs", run_id="RUN_PRIMARY", trial_id="T1", plan_id="P1", purpose="primary_locked",
+        code_commit="synthetic", run_at="2025-05-28T09:00:00Z", run_by="trial statistician")
     con.commit()
     return con, model, truth
 

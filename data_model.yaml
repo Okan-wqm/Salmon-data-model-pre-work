@@ -51,8 +51,10 @@
 #   - Metrics: tools/metrics.py is the reference implementation of derived_metrics (METRICS
 #     registry, one function per key). Thresholds: tools/calibrate_params.py estimates
 #     validation_params from historical trials loaded into this schema.
+#   - Statistics: tools/analysis.py runs the outcomes registered in planned_outcomes (ANALYSES
+#     registry, one function per analysis); tools/build_dashboard.py shows a trial on one page.
 #   - python3 tools/run_all_tests.py runs the whole chain in dependency order and fails if any
-#     metric, validator rule or constraint is not exercised by a test.
+#     metric, validator rule, constraint or analysis is not exercised by a test.
 #
 # Deferred (not modelled): RAS operations log (backwash, ozone, biofilter), diet ingredient
 #   matrix, maturation census table, neighbour-farm exposure series, ontology mapping,

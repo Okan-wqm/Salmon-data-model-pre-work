@@ -1,0 +1,3 @@
+# tools/build_dashboard.py and tools/test_dashboard.py, in addition to requirements-analysis.txt.
+# Tested with matplotlib 3.11.2.
+matplotlib>=3.8
